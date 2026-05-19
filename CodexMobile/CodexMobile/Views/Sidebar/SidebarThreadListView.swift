@@ -1,0 +1,539 @@
+// FILE: SidebarThreadListView.swift
+// Purpose: Renders sidebar thread groups and empty states.
+// Layer: View Component
+// Exports: SidebarThreadListView
+
+import SwiftUI
+
+struct SidebarThreadListView: View {
+    var isFiltering: Bool = false
+    let isConnected: Bool
+    let isCreatingThread: Bool
+    let threads: [CodexThread]
+    let groups: [SidebarThreadGroup]
+    let selectedThread: CodexThread?
+    let bottomContentInset: CGFloat
+    let timingLabelProvider: (CodexThread) -> String?
+    let runBadgeStateByThreadID: [String: CodexThreadRunBadgeState]
+    let onSelectThread: (CodexThread) -> Void
+    let onCreateThreadInProjectGroup: (SidebarThreadGroup) -> Void
+    var onArchiveProjectGroup: ((SidebarThreadGroup) -> Void)? = nil
+    var onDeleteProjectGroup: ((SidebarThreadGroup) -> Void)? = nil
+    var onRenameThread: ((CodexThread, String) -> Void)? = nil
+    var onPinToggleThread: ((CodexThread) -> Void)? = nil
+    var onArchiveToggleThread: ((CodexThread) -> Void)? = nil
+    var onDeleteThread: ((CodexThread) -> Void)? = nil
+    @Environment(CodexService.self) private var codex
+    @AppStorage("sidebar.collapsedProjectGroupIDs") private var collapsedProjectGroupIDsStorage = ""
+    @State private var expandedProjectGroupIDs: Set<String> = []
+    @State private var knownProjectGroupIDs: Set<String> = []
+    @State private var hasInitializedProjectGroupExpansion = false
+    @State private var isArchivedExpanded = false
+    @State private var isPinnedExpanded = true
+    @State private var expandedSubagentParentIDs: Set<String> = []
+    // Tracks project sections whose preview cap was manually lifted with Show more.
+    @State private var revealedProjectGroupIDs: Set<String> = []
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 0) {
+
+            if threads.isEmpty && !isFiltering {
+                Text(isConnected ? "No conversations" : "Connect to view conversations")
+                    .foregroundStyle(.secondary)
+                    .font(AppFont.subheadline())
+                    .padding(.horizontal, 16)
+                    .padding(.top, 20)
+            } else if groups.flatMap(\.threads).isEmpty && isFiltering {
+                Text("No matching conversations")
+                    .foregroundStyle(.secondary)
+                    .font(AppFont.subheadline())
+                    .padding(.horizontal, 16)
+                    .padding(.top, 20)
+            } else {
+                ForEach(groups) { group in
+                    groupSection(group)
+                }
+            }
+        }
+        // Keeps the last rows reachable above the floating settings control.
+        .padding(.bottom, bottomContentInset)
+        .task(id: visibleSubagentThreadIDs) {
+            await codex.loadSubagentThreadMetadataIfNeeded(threadIds: visibleSubagentThreadIDs)
+        }
+        .onAppear {
+            syncExpandedProjectGroupState()
+            syncRevealedProjectGroupState()
+            revealSelectedThreadProjectGroup()
+            revealSelectedSubagentAncestors()
+        }
+        .onChange(of: groups.map(\.id)) { _, _ in
+            syncExpandedProjectGroupState()
+            syncRevealedProjectGroupState()
+            revealSelectedThreadProjectGroup()
+            revealSelectedSubagentAncestors()
+        }
+        .onChange(of: selectedThread?.id) { _, _ in
+            revealSelectedThreadProjectGroup()
+            revealSelectedSubagentAncestors()
+        }
+        .onChange(of: selectedSubagentAncestorIDs) { _, _ in
+            revealSelectedThreadProjectGroup()
+            revealSelectedSubagentAncestors()
+        }
+    }
+
+    @ViewBuilder
+    private func groupSection(_ group: SidebarThreadGroup) -> some View {
+        switch group.kind {
+        case .pinned:
+            pinnedGroupSection(group)
+        case .project:
+            projectGroupSection(group)
+
+        case .archived:
+            archivedGroupSection(group)
+        }
+    }
+
+    private func pinnedGroupSection(_ group: SidebarThreadGroup) -> some View {
+        let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
+
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isPinnedExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    RemodexIcon.image(systemName: "pin", size: 20, weight: .medium)
+                        .foregroundStyle(.primary)
+                    Text(group.label)
+                        .font(AppFont.body(weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer()
+                    RemodexIcon.image(systemName: "chevron.right")
+                        .font(AppFont.caption(weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isPinnedExpanded ? 90 : 0))
+                        .animation(.easeInOut(duration: 0.2), value: isPinnedExpanded)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.top, 6)
+            .padding(.bottom, 10)
+
+            if isPinnedExpanded {
+                VStack(spacing: 2) {
+                    ForEach(hierarchy.rootThreads) { thread in
+                        threadRowTree(
+                            thread,
+                            childrenByParentID: hierarchy.childrenByParentID,
+                            pinnedRootThreadIDs: Set(hierarchy.rootThreads.map(\.id))
+                        )
+                    }
+                }
+                .padding(.bottom, 14)
+                .transition(.opacity)
+            }
+        }
+    }
+
+    private func projectGroupSection(_ group: SidebarThreadGroup) -> some View {
+        let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
+        let visibleRootThreads = SidebarProjectThreadPreviewState.visibleRootThreads(
+            for: group,
+            selectedThread: selectedThread,
+            isFiltering: isFiltering,
+            manuallyExpandedGroupIDs: revealedProjectGroupIDs
+        )
+        let shouldShowMoreButton = SidebarProjectThreadPreviewState.shouldShowMoreButton(
+            for: group,
+            selectedThread: selectedThread,
+            isFiltering: isFiltering,
+            manuallyExpandedGroupIDs: revealedProjectGroupIDs
+        )
+
+        return VStack(alignment: .leading, spacing: 0) {
+            projectHeader(group)
+
+            if expandedProjectGroupIDs.contains(group.id) {
+                VStack(spacing: 2) {
+                    ForEach(visibleRootThreads) { thread in
+                        threadRowTree(
+                            thread,
+                            childrenByParentID: hierarchy.childrenByParentID
+                        )
+                    }
+
+                    if shouldShowMoreButton {
+                        let totalRootCount = SidebarProjectThreadPreviewState.rootThreads(in: group.threads).count
+                        let hiddenCount = totalRootCount - visibleRootThreads.count
+                        SidebarProjectShowMoreButton(hiddenCount: hiddenCount) {
+                            revealedProjectGroupIDs.insert(group.id)
+                        }
+                    }
+                }
+                .padding(.bottom, 14)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .animation(.snappy(duration: 0.22), value: expandedProjectGroupIDs.contains(group.id))
+    }
+
+    private func projectHeader(_ group: SidebarThreadGroup) -> some View {
+        let isExpanded = expandedProjectGroupIDs.contains(group.id)
+
+        return HStack(spacing: 12) {
+            Button {
+                HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                toggleProjectGroupExpansion(group.id)
+            } label: {
+                HStack(spacing: 8) {
+                    if group.iconSystemName == "arrow.triangle.branch" {
+                        CodexWorktreeIcon(pointSize: 16, weight: .medium)
+                            .foregroundStyle(.primary)
+                    } else {
+                        RemodexIcon.image(systemName: projectHeaderIconName(for: group, isExpanded: isExpanded))
+                            .font(AppFont.body(weight: .medium))
+                            .foregroundStyle(.primary)
+                            .contentTransition(.symbolEffect(.replace))
+                    }
+                    Text(group.label)
+                        .font(AppFont.body(weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                if let onArchiveProjectGroup {
+                    Button {
+                        HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                        onArchiveProjectGroup(group)
+                    } label: {
+                        RemodexIcon.label("Archive Project", systemName: "archivebox")
+                    }
+                }
+
+                if let onDeleteProjectGroup {
+                    Button(role: .destructive) {
+                        HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                        onDeleteProjectGroup(group)
+                    } label: {
+                        Label("Remove from Phone", systemImage: "trash")
+                    }
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    HapticFeedback.shared.triggerImpactFeedback()
+                    onCreateThreadInProjectGroup(group)
+                } label: {
+                    RemodexIcon.image(systemName: "square.and.pencil", size: 20, weight: .medium)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+                .disabled(!isConnected || isCreatingThread)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 18)
+        .padding(.bottom, 10)
+    }
+
+    private func projectHeaderIconName(for group: SidebarThreadGroup, isExpanded: Bool) -> String {
+        if isExpanded, group.iconSystemName == "folder" {
+            return "folder.fill"
+        }
+        return group.iconSystemName
+    }
+
+    private func archivedGroupSection(_ group: SidebarThreadGroup) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isArchivedExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    RemodexIcon.image(systemName: "archivebox")
+                        .font(AppFont.body(weight: .medium))
+                        .foregroundStyle(.primary)
+                    Text(group.label)
+                        .font(AppFont.body(weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer()
+                    RemodexIcon.image(systemName: "chevron.right")
+                        .font(AppFont.caption(weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isArchivedExpanded ? 90 : 0))
+                        .animation(.easeInOut(duration: 0.2), value: isArchivedExpanded)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.top, 18)
+            .padding(.bottom, 10)
+
+            if isArchivedExpanded {
+                VStack(spacing: 4) {
+                    ForEach(group.threads) { thread in
+                        threadRow(thread)
+                    }
+                }
+                .padding(.bottom, 14)
+                .transition(.opacity)
+            }
+        }
+    }
+
+    private func threadRowTree(
+        _ thread: CodexThread,
+        childrenByParentID: [String: [CodexThread]],
+        ancestorThreadIDs: Set<String> = [],
+        pinnedRootThreadIDs: Set<String> = []
+    ) -> AnyView {
+        let childThreads = childrenByParentID[thread.id] ?? []
+        let isExpanded = expandedSubagentParentIDs.contains(thread.id)
+        let nextAncestorThreadIDs = ancestorThreadIDs.union([thread.id])
+
+        return AnyView(VStack(alignment: .leading, spacing: thread.isSubagent ? 2 : 4) {
+            threadRow(
+                thread,
+                isPinnedRow: pinnedRootThreadIDs.contains(thread.id),
+                childSubagentCount: childThreads.count,
+                isSubagentExpanded: isExpanded,
+                onToggleSubagents: childThreads.isEmpty ? nil : {
+                    toggleSubagentExpansion(parentThreadID: thread.id)
+                }
+            )
+
+            if isExpanded, !childThreads.isEmpty {
+                VStack(spacing: 2) {
+                    ForEach(childThreads) { childThread in
+                        if nextAncestorThreadIDs.contains(childThread.id) {
+                            AnyView(threadRow(childThread))
+                        } else {
+                            threadRowTree(
+                                childThread,
+                                childrenByParentID: childrenByParentID,
+                                ancestorThreadIDs: nextAncestorThreadIDs,
+                                pinnedRootThreadIDs: pinnedRootThreadIDs
+                            )
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    private func threadRow(
+        _ thread: CodexThread,
+        isPinnedRow: Bool = false,
+        childSubagentCount: Int = 0,
+        isSubagentExpanded: Bool = false,
+        onToggleSubagents: (() -> Void)? = nil
+    ) -> some View {
+        let isSelected = selectedThread?.id == thread.id
+
+        return SidebarThreadRowView(
+            thread: thread,
+            isSelected: isSelected,
+            runBadgeState: runBadgeStateByThreadID[thread.id],
+            timingLabel: timingLabelProvider(thread),
+            isPinned: codex.isThreadPinned(thread.id),
+            pinnedProjectLabel: isPinnedRow ? thread.projectDisplayName : nil,
+            childSubagentCount: childSubagentCount,
+            isSubagentExpanded: isSubagentExpanded,
+            onToggleSubagents: onToggleSubagents,
+            onTap: {
+                if isSelected, childSubagentCount > 0 {
+                    onToggleSubagents?()
+                } else {
+                    onSelectThread(thread)
+                }
+            },
+            onRename: onRenameThread.map { handler in { newName in handler(thread, newName) } },
+            onPinToggle: onPinToggleThread.map { handler in { handler(thread) } },
+            onArchiveToggle: onArchiveToggleThread.map { handler in { handler(thread) } },
+            onDelete: onDeleteThread.map { handler in { handler(thread) } }
+        )
+    }
+
+    // Preloads metadata only for subagent rows that are currently reachable in the sidebar tree.
+    private var visibleSubagentThreadIDs: [String] {
+        var visibleThreadIDs: [String] = []
+
+        for group in groups {
+            switch group.kind {
+            case .pinned:
+                guard isPinnedExpanded else { continue }
+                let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
+                for rootThread in hierarchy.rootThreads {
+                    collectVisibleSubagentThreadIDs(
+                        from: rootThread,
+                        childrenByParentID: hierarchy.childrenByParentID,
+                        ancestorThreadIDs: [],
+                        into: &visibleThreadIDs
+                    )
+                }
+            case .project:
+                guard expandedProjectGroupIDs.contains(group.id) else { continue }
+                let hierarchy = SidebarSubagentHierarchy(groupThreads: group.threads)
+                let visibleRootThreads = SidebarProjectThreadPreviewState.visibleRootThreads(
+                    for: group,
+                    selectedThread: selectedThread,
+                    isFiltering: isFiltering,
+                    manuallyExpandedGroupIDs: revealedProjectGroupIDs
+                )
+                for rootThread in visibleRootThreads {
+                    collectVisibleSubagentThreadIDs(
+                        from: rootThread,
+                        childrenByParentID: hierarchy.childrenByParentID,
+                        ancestorThreadIDs: [],
+                        into: &visibleThreadIDs
+                    )
+                }
+            case .archived:
+                guard isArchivedExpanded else { continue }
+                for thread in group.threads where thread.isSubagent {
+                    visibleThreadIDs.append(thread.id)
+                }
+            }
+        }
+
+        return visibleThreadIDs
+    }
+
+    private var selectedSubagentAncestorIDs: Set<String> {
+        guard let selectedThread else { return [] }
+        return subagentAncestorIDs(for: selectedThread)
+    }
+
+    private func collectVisibleSubagentThreadIDs(
+        from thread: CodexThread,
+        childrenByParentID: [String: [CodexThread]],
+        ancestorThreadIDs: Set<String>,
+        into visibleThreadIDs: inout [String]
+    ) {
+        if thread.isSubagent {
+            visibleThreadIDs.append(thread.id)
+        }
+
+        guard expandedSubagentParentIDs.contains(thread.id) else {
+            return
+        }
+
+        let nextAncestorThreadIDs = ancestorThreadIDs.union([thread.id])
+        for childThread in childrenByParentID[thread.id] ?? [] {
+            guard !nextAncestorThreadIDs.contains(childThread.id) else { continue }
+            collectVisibleSubagentThreadIDs(
+                from: childThread,
+                childrenByParentID: childrenByParentID,
+                ancestorThreadIDs: nextAncestorThreadIDs,
+                into: &visibleThreadIDs
+            )
+        }
+    }
+
+    private func toggleProjectGroupExpansion(_ groupID: String) {
+        withAnimation(.snappy(duration: 0.22)) {
+            var persistedCollapsedGroupIDs = SidebarProjectExpansionState.decodePersistedGroupIDs(
+                collapsedProjectGroupIDsStorage
+            )
+            if expandedProjectGroupIDs.contains(groupID) {
+                expandedProjectGroupIDs.remove(groupID)
+                revealedProjectGroupIDs.remove(groupID)
+                persistedCollapsedGroupIDs.insert(groupID)
+            } else {
+                expandedProjectGroupIDs.insert(groupID)
+                persistedCollapsedGroupIDs.remove(groupID)
+            }
+            collapsedProjectGroupIDsStorage = SidebarProjectExpansionState.encodePersistedGroupIDs(
+                persistedCollapsedGroupIDs
+            )
+        }
+    }
+
+    // Keep project sections expanded after regrouping so live updates do not collapse the sidebar.
+    private func syncExpandedProjectGroupState() {
+        let nextState = SidebarProjectExpansionState.synchronizedState(
+            currentExpandedGroupIDs: expandedProjectGroupIDs,
+            knownGroupIDs: knownProjectGroupIDs,
+            visibleGroups: groups,
+            hasInitialized: hasInitializedProjectGroupExpansion,
+            persistedCollapsedGroupIDs: SidebarProjectExpansionState.decodePersistedGroupIDs(
+                collapsedProjectGroupIDsStorage
+            )
+        )
+        expandedProjectGroupIDs = nextState.expandedGroupIDs
+        knownProjectGroupIDs = nextState.knownGroupIDs
+        hasInitializedProjectGroupExpansion = true
+    }
+
+    // Keeps Show more expansion state only for project groups that still exist on screen.
+    private func syncRevealedProjectGroupState() {
+        let visibleProjectGroupIDs = Set(
+            groups
+                .filter { $0.kind == .project }
+                .map(\.id)
+        )
+        revealedProjectGroupIDs = revealedProjectGroupIDs.intersection(visibleProjectGroupIDs)
+    }
+
+    // Keeps an externally selected thread visible without re-opening unrelated project groups.
+    private func revealSelectedThreadProjectGroup() {
+        if let selectedGroupID = SidebarProjectExpansionState.groupIDContainingSelectedThread(
+            selectedThread,
+            in: groups
+        ),
+           SidebarProjectExpansionState.shouldAutoRevealSelectedGroup(
+               selectedGroupID,
+               persistedCollapsedGroupIDs: SidebarProjectExpansionState.decodePersistedGroupIDs(
+                   collapsedProjectGroupIDsStorage
+               )
+        ) {
+            expandedProjectGroupIDs.insert(selectedGroupID)
+        }
+    }
+
+    private func toggleSubagentExpansion(parentThreadID: String) {
+        if expandedSubagentParentIDs.contains(parentThreadID) {
+            expandedSubagentParentIDs.remove(parentThreadID)
+        } else {
+            expandedSubagentParentIDs.insert(parentThreadID)
+        }
+    }
+
+    // Expands every visible ancestor so a selected child thread is never hidden in the tree.
+    private func revealSelectedSubagentAncestors() {
+        guard let selectedThread else { return }
+        expandedSubagentParentIDs.formUnion(subagentAncestorIDs(for: selectedThread))
+    }
+
+    private func subagentAncestorIDs(for thread: CodexThread) -> Set<String> {
+        let threadsByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0) })
+        var ancestorIDs: Set<String> = []
+        var currentParentID = thread.parentThreadId
+
+        while let parentID = currentParentID, !ancestorIDs.contains(parentID) {
+            ancestorIDs.insert(parentID)
+            currentParentID = threadsByID[parentID]?.parentThreadId
+        }
+
+        return ancestorIDs
+    }
+}
