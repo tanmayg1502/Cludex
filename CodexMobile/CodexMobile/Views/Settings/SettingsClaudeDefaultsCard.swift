@@ -9,9 +9,11 @@ import SwiftUI
 struct SettingsClaudeDefaultsCard: View {
     @Environment(CodexService.self) private var codex
 
-    @AppStorage("claude.defaultModel")         private var defaultModel = "claude-sonnet-4-6"
-    @AppStorage("claude.permissionMode")       private var permissionMode = "acceptEdits"
-    @AppStorage("claude.permissionTimeoutSecs") private var permissionTimeoutSecs = 30
+    @AppStorage(CodexClaudeDefaults.defaultModelDefaultsKey) private var defaultModel = CodexClaudeDefaults.defaultModel
+    @AppStorage(CodexClaudeDefaults.permissionModeDefaultsKey) private var permissionMode = CodexClaudeDefaults.defaultPermissionMode
+    @AppStorage(CodexClaudeDefaults.permissionTimeoutSecsDefaultsKey) private var permissionTimeoutSecs = CodexClaudeDefaults.defaultPermissionTimeoutSecs
+
+    @State private var preferencesSyncTask: Task<Void, Never>?
 
     private let timeoutOptions: [(label: String, value: Int)] = [
         ("10 seconds", 10),
@@ -27,7 +29,7 @@ struct SettingsClaudeDefaultsCard: View {
                     Text(model.displayName).tag(model.model)
                 }
                 if claudeModels.isEmpty {
-                    Text("Claude Sonnet (default)").tag("claude-sonnet-4-6")
+                    Text("Claude Sonnet (default)").tag(CodexClaudeDefaults.defaultModel)
                 }
             }
             .pickerStyle(.menu)
@@ -48,9 +50,38 @@ struct SettingsClaudeDefaultsCard: View {
             .pickerStyle(.menu)
             .tint(.primary)
         }
+        .onChange(of: defaultModel) { _, _ in
+            syncClaudeDefaultsToBridge()
+        }
+        .onChange(of: permissionMode) { _, _ in
+            syncClaudeDefaultsToBridge()
+        }
+        .onChange(of: permissionTimeoutSecs) { _, _ in
+            syncClaudeDefaultsToBridge()
+        }
+        .onDisappear {
+            preferencesSyncTask?.cancel()
+            preferencesSyncTask = nil
+        }
     }
 
     private var claudeModels: [CodexModelOption] {
         codex.availableModels.filter { $0.model.hasPrefix("claude-") }
+    }
+
+    private func syncClaudeDefaultsToBridge() {
+        let model = self.defaultModel
+        let permissionMode = self.permissionMode
+        let permissionTimeoutSecs = self.permissionTimeoutSecs
+
+        preferencesSyncTask?.cancel()
+        preferencesSyncTask = Task { @MainActor in
+            await codex.syncBridgeClaudeDefaultsPreferenceIfNeeded(
+                model: model,
+                permissionMode: permissionMode,
+                permissionTimeoutSecs: permissionTimeoutSecs,
+                showFailureInUI: true
+            )
+        }
     }
 }

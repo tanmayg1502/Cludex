@@ -89,6 +89,7 @@ function redactAuthStatus(authStatus = null, extras = {}) {
 function composeSanitizedAuthStatusFromSettledResults({
   accountReadResult = null,
   authStatusResult = null,
+  claudeAuth = null,
   loginInFlight = false,
   bridgeVersionInfo = null,
   transportMode = null,
@@ -103,13 +104,53 @@ function composeSanitizedAuthStatusFromSettledResults({
     throw error;
   }
 
-  return redactAuthStatus(authStatus, {
-    accountRead,
-    loginInFlight: Boolean(loginInFlight),
-    bridgeVersionInfo,
-    transportMode,
-    hostPlatform,
-  });
+  return {
+    ...redactAuthStatus(authStatus, {
+      accountRead,
+      loginInFlight: Boolean(loginInFlight),
+      bridgeVersionInfo,
+      transportMode,
+      hostPlatform,
+    }),
+    claude: sanitizeClaudeAuthStatus(claudeAuth),
+  };
+}
+
+function sanitizeClaudeAuthStatus(claudeAuth = null) {
+  const raw = unwrapSettledClaudeAuth(claudeAuth);
+  if (!raw || typeof raw !== "object") {
+    return defaultClaudeAuthStatus();
+  }
+
+  const authenticated = raw.authenticated === true;
+  const email = normalizeString(raw.email) || null;
+  const loginRequired = typeof raw.loginRequired === "boolean"
+    ? raw.loginRequired
+    : !authenticated;
+
+  return {
+    authenticated,
+    email,
+    loginRequired,
+  };
+}
+
+function unwrapSettledClaudeAuth(claudeAuth) {
+  if (claudeAuth?.status === "fulfilled") {
+    return claudeAuth.value;
+  }
+  if (claudeAuth?.status === "rejected") {
+    return null;
+  }
+  return claudeAuth;
+}
+
+function defaultClaudeAuthStatus() {
+  return {
+    authenticated: false,
+    email: null,
+    loginRequired: true,
+  };
 }
 
 // Treat explicit account signals as authenticated when the token read is temporarily unavailable.

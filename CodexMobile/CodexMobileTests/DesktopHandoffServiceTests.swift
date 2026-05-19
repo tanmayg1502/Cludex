@@ -157,6 +157,38 @@ final class DesktopHandoffServiceTests: XCTestCase {
         }
     }
 
+    func testClaudeDefaultsPreferenceSyncUsesDesktopPreferencesUpdate() async {
+        let service = makeService()
+        service.isConnected = true
+        service.keepMacAwakeWhileBridgeRuns = true
+
+        var capturedMethod: String?
+        var capturedParams: JSONValue?
+        service.requestTransportOverride = { method, params in
+            capturedMethod = method
+            capturedParams = params
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object(["success": .bool(true)]),
+                includeJSONRPC: false
+            )
+        }
+
+        await service.syncBridgeClaudeDefaultsPreferenceIfNeeded(
+            model: " claude-opus-4-7 ",
+            permissionMode: "bypassPermissions",
+            permissionTimeoutSecs: 120,
+            showFailureInUI: true
+        )
+
+        let payload = capturedParams?.objectValue
+        XCTAssertEqual(capturedMethod, "desktop/preferences/update")
+        XCTAssertEqual(payload?["keepMacAwake"]?.boolValue, true)
+        XCTAssertEqual(payload?["claudeCodeDefaultModel"]?.stringValue, "claude-opus-4-7")
+        XCTAssertEqual(payload?["claudeCodeDefaultPermissionMode"]?.stringValue, "bypassPermissions")
+        XCTAssertEqual(payload?["permissionTimeoutSecs"]?.intValue, 120)
+    }
+
     func testUnsupportedPlatformMessageIsPlatformNeutral() {
         let error = DesktopHandoffError.bridgeError(
             code: "unsupported_platform",

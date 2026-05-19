@@ -82,6 +82,90 @@ final class CodexGPTAccountTests: XCTestCase {
         XCTAssertNil(service.gptAccountErrorMessage)
     }
 
+    func testRefreshAccountStateDecodesNestedClaudeStatus() async {
+        let service = makeService()
+        service.isConnected = true
+
+        service.requestTransportOverride = { method, params in
+            XCTAssertEqual(method, "account/status/read")
+            XCTAssertNil(params)
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([
+                    "status": .string("authenticated"),
+                    "authMethod": .string("chatgpt"),
+                    "email": .string("user@example.com"),
+                    "loginInFlight": .bool(false),
+                    "needsReauth": .bool(false),
+                    "tokenReady": .bool(true),
+                    "claude": .object([
+                        "authenticated": .bool(true),
+                        "email": .string(" claude@example.com "),
+                        "loginRequired": .bool(false),
+                    ]),
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        await service.refreshClaudeAccountState()
+
+        XCTAssertEqual(service.claudeAccountSnapshot.status, .authenticated)
+        XCTAssertEqual(service.claudeAccountSnapshot.email, "claude@example.com")
+        XCTAssertFalse(service.claudeAccountSnapshot.loginInFlight)
+        XCTAssertFalse(service.claudeAccountSnapshot.loginRequired)
+        XCTAssertNil(service.claudeAccountErrorMessage)
+    }
+
+    func testStartClaudeLoginPollsUntilAuthenticated() async throws {
+        let service = makeService()
+        service.isConnected = true
+        var observedMethods: [String] = []
+        var statusPollCount = 0
+
+        service.requestTransportOverride = { method, params in
+            observedMethods.append(method)
+            XCTAssertNil(params)
+
+            switch method {
+            case "claude/login/start":
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "ok": .bool(true),
+                    ]),
+                    includeJSONRPC: false
+                )
+            case "claude/login/status":
+                statusPollCount += 1
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object([
+                        "authenticated": .bool(statusPollCount >= 2),
+                        "email": .string(statusPollCount >= 2 ? "claude@example.com" : ""),
+                        "loginRequired": .bool(statusPollCount < 2),
+                    ]),
+                    includeJSONRPC: false
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                throw CodexServiceError.disconnected
+            }
+        }
+
+        let snapshot = try await service.startClaudeLogin(
+            pollIntervalNanoseconds: 1_000_000,
+            timeoutNanoseconds: 100_000_000
+        )
+
+        XCTAssertEqual(observedMethods, ["claude/login/start", "claude/login/status", "claude/login/status"])
+        XCTAssertEqual(snapshot.status, .authenticated)
+        XCTAssertEqual(service.claudeAccountSnapshot.status, .authenticated)
+        XCTAssertEqual(service.claudeAccountSnapshot.email, "claude@example.com")
+        XCTAssertFalse(service.claudeAccountSnapshot.loginInFlight)
+        XCTAssertNil(service.claudeAccountErrorMessage)
+    }
+
     func testRefreshGPTAccountStateFallsBackToLegacyGetAuthStatusPayload() async {
         let service = makeService()
         service.isConnected = true

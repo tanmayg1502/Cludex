@@ -19,6 +19,29 @@ struct CodexApprovalRequest: Identifiable, Sendable {
     let threadId: String?
     let turnId: String?
     let params: JSONValue?
+    let permissionId: String?
+
+    init(
+        id: String,
+        requestID: JSONValue,
+        method: String,
+        command: String?,
+        reason: String?,
+        threadId: String?,
+        turnId: String?,
+        params: JSONValue?,
+        permissionId: String? = nil
+    ) {
+        self.id = id
+        self.requestID = requestID
+        self.method = method
+        self.command = command
+        self.reason = reason
+        self.threadId = threadId
+        self.turnId = turnId
+        self.params = params
+        self.permissionId = permissionId
+    }
 }
 
 struct CodexRecentActivityLine {
@@ -403,8 +426,15 @@ final class CodexService {
             persistGPTAccountSnapshot(gptAccountSnapshot)
         }
     }
+    // Bridge-owned Claude auth snapshot used by Settings. Tokens remain bridge-local.
+    var claudeAccountSnapshot: CodexClaudeAccountSnapshot = codexClaudeAccountInitialSnapshot() {
+        didSet {
+            persistClaudeAccountSnapshot(claudeAccountSnapshot)
+        }
+    }
     // Holds the most recent account-specific error without colliding with transport-level failures.
     var gptAccountErrorMessage: String?
+    var claudeAccountErrorMessage: String?
     var isLoadingModels = false
     var modelsErrorMessage: String?
     var notificationAuthorizationStatus: UNAuthorizationStatus = .notDetermined
@@ -853,6 +883,12 @@ final class CodexService {
             self.gptAccountSnapshot = persistedGPTAccountSnapshot
         } else {
             self.gptAccountSnapshot = codexGPTAccountInitialSnapshot()
+        }
+
+        if let persistedClaudeAccountSnapshot = loadPersistedClaudeAccountSnapshot() {
+            self.claudeAccountSnapshot = persistedClaudeAccountSnapshot
+        } else {
+            self.claudeAccountSnapshot = codexClaudeAccountInitialSnapshot()
         }
 
         if let pendingLogin = gptPendingLoginState,

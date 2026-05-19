@@ -126,6 +126,7 @@ extension CodexService {
             || method == "item/fileChange/requestApproval"
             || method.hasSuffix("requestApproval") {
             let paramsObject = params?.objectValue
+            let permissionId = normalizedApprovalPermissionId(from: paramsObject)
             let request = CodexApprovalRequest(
                 id: idKey(from: requestID),
                 requestID: requestID,
@@ -134,7 +135,8 @@ extension CodexService {
                 reason: paramsObject?["reason"]?.stringValue,
                 threadId: paramsObject?["threadId"]?.stringValue,
                 turnId: paramsObject?["turnId"]?.stringValue,
-                params: params
+                params: params,
+                permissionId: permissionId
             )
 
             if selectedAccessMode == .fullAccess {
@@ -636,8 +638,20 @@ extension CodexService {
 
     // Removes the auto-denied approval from the queue so the UI clears promptly.
     private func handleClaudeApprovalTimeout(_ paramsObject: IncomingParamsObject?) {
-        guard let permissionId = paramsObject?["permissionId"]?.stringValue else { return }
-        removePendingApproval (requestID: .string(permissionId))
+        let permissionId = normalizedApprovalPermissionId(from: paramsObject)
+        let requestID = paramsObject?["requestId"] ?? paramsObject?["requestID"]
+        guard permissionId != nil || requestID != nil else { return }
+        removePendingApproval(requestID: requestID, permissionId: permissionId)
+        lastErrorMessage = "Claude approval timed out."
+    }
+
+    private func normalizedApprovalPermissionId(from paramsObject: IncomingParamsObject?) -> String? {
+        guard let rawValue = paramsObject?["permissionId"]?.stringValue else {
+            return nil
+        }
+
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func handleThreadStatusChanged(_ paramsObject: IncomingParamsObject?) {
@@ -3210,13 +3224,17 @@ extension CodexService {
 
     // Cleans up any server-owned request once app-server confirms the specific request id is resolved.
     func handleServerRequestResolved(_ paramsObject: IncomingParamsObject?) {
-        guard let requestID = paramsObject?["requestId"] else {
+        let requestID = paramsObject?["requestId"] ?? paramsObject?["requestID"]
+        let permissionId = normalizedApprovalPermissionId(from: paramsObject)
+        guard requestID != nil || permissionId != nil else {
             return
         }
 
         let threadId = normalizedResolvedRequestThreadID(paramsObject?["threadId"]?.stringValue)
-        removeStructuredUserInputPrompt(requestID: requestID, threadIdHint: threadId)
-        removePendingApproval(requestID: requestID)
+        if let requestID {
+            removeStructuredUserInputPrompt(requestID: requestID, threadIdHint: threadId)
+        }
+        removePendingApproval(requestID: requestID, permissionId: permissionId)
     }
 
     // Routes phase notifications from `git/runStackedAction` to the per-call subscriber.

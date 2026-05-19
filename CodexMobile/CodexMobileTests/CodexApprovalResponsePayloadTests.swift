@@ -82,6 +82,35 @@ final class CodexApprovalResponsePayloadTests: XCTestCase {
         )
     }
 
+    func testPermissionsApprovalResponseIgnoresPermissionIdInPayloadShape() {
+        let service = makeService()
+        let requestedPermissions: JSONValue = .object([
+            "network": .object(["enabled": .bool(true)]),
+        ])
+        let request = CodexApprovalRequest(
+            id: "permissions-rpc-1",
+            requestID: .string("permissions-rpc-1"),
+            method: "item/permissions/requestApproval",
+            command: nil,
+            reason: "Need network access",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            params: .object([
+                "permissionId": .string("permission-1"),
+                "permissions": requestedPermissions,
+            ]),
+            permissionId: "permission-1"
+        )
+
+        XCTAssertEqual(
+            service.approvalResponseResult(for: request, decision: "accept"),
+            .object([
+                "permissions": requestedPermissions,
+                "scope": .string("turn"),
+            ])
+        )
+    }
+
     func testPermissionsDeclineResponseReturnsEmptyTurnGrant() {
         let service = makeService()
         let request = CodexApprovalRequest(

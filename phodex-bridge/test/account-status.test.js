@@ -254,6 +254,11 @@ test("composeSanitizedAuthStatusFromSettledResults keeps the available auth snap
     bridgeVersion: bridgePackageVersion,
     bridgeLatestVersion: "9.9.9",
     ...macHostMetadata,
+    claude: {
+      authenticated: false,
+      email: null,
+      loginRequired: true,
+    },
   });
 });
 
@@ -291,7 +296,114 @@ test("composeSanitizedAuthStatusFromSettledResults keeps authenticated UI state 
     bridgeVersion: bridgePackageVersion,
     bridgeLatestVersion: "9.9.9",
     ...macHostMetadata,
+    claude: {
+      authenticated: false,
+      email: null,
+      loginRequired: true,
+    },
   });
+});
+
+test("composeSanitizedAuthStatusFromSettledResults includes sanitized authenticated Claude status", () => {
+  const status = composeSanitizedAuthStatusFromSettledResults(withMacHost({
+    accountReadResult: {
+      status: "fulfilled",
+      value: {
+        account: {
+          type: "chatgpt",
+          email: "user@example.com",
+        },
+        requiresOpenaiAuth: false,
+      },
+    },
+    authStatusResult: {
+      status: "fulfilled",
+      value: {
+        authMethod: "chatgpt",
+        authToken: "token-value",
+      },
+    },
+    claudeAuth: {
+      authenticated: true,
+      email: " claude@example.com ",
+      loginRequired: false,
+      token: "must-not-leak",
+    },
+  }));
+
+  assert.deepEqual(status.claude, {
+    authenticated: true,
+    email: "claude@example.com",
+    loginRequired: false,
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(status.claude, "token"), false);
+  assert.equal(status.status, "authenticated");
+  assert.equal(status.authMethod, "chatgpt");
+  assert.equal(status.email, "user@example.com");
+});
+
+test("composeSanitizedAuthStatusFromSettledResults includes sanitized Claude login-required status", () => {
+  const status = composeSanitizedAuthStatusFromSettledResults(withMacHost({
+    accountReadResult: {
+      status: "fulfilled",
+      value: {
+        account: null,
+        requiresOpenaiAuth: true,
+      },
+    },
+    authStatusResult: {
+      status: "fulfilled",
+      value: {
+        authMethod: null,
+        authToken: null,
+      },
+    },
+    claudeAuth: {
+      authenticated: false,
+      email: "",
+      loginRequired: true,
+      refreshToken: "must-not-leak",
+    },
+  }));
+
+  assert.deepEqual(status.claude, {
+    authenticated: false,
+    email: null,
+    loginRequired: true,
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(status.claude, "refreshToken"), false);
+  assert.equal(status.status, "not_logged_in");
+  assert.equal(status.needsReauth, false);
+});
+
+test("composeSanitizedAuthStatusFromSettledResults falls back when Claude auth is missing", () => {
+  const status = composeSanitizedAuthStatusFromSettledResults(withMacHost({
+    accountReadResult: {
+      status: "fulfilled",
+      value: {
+        account: {
+          type: "chatgpt",
+          email: "user@example.com",
+        },
+        requiresOpenaiAuth: false,
+      },
+    },
+    authStatusResult: {
+      status: "fulfilled",
+      value: {
+        authMethod: "chatgpt",
+        authToken: "token-value",
+      },
+    },
+  }));
+
+  assert.deepEqual(status.claude, {
+    authenticated: false,
+    email: null,
+    loginRequired: true,
+  });
+  assert.equal(status.status, "authenticated");
+  assert.equal(status.tokenReady, true);
 });
 
 test("composeSanitizedAuthStatusFromSettledResults fails when both auth reads fail", () => {

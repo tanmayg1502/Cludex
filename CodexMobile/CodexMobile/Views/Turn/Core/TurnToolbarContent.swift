@@ -12,6 +12,40 @@ struct TurnThreadNavigationContext {
     let fullPath: String
 }
 
+private enum TurnThreadAgentOption: String, CaseIterable, Identifiable {
+    case codex = "codex"
+    case claude = "claude-code"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .codex:
+            return "Codex"
+        case .claude:
+            return "Claude"
+        }
+    }
+
+    var systemName: String {
+        switch self {
+        case .codex:
+            return "sparkles"
+        case .claude:
+            return "terminal"
+        }
+    }
+
+    static func resolved(from agentId: String?) -> TurnThreadAgentOption {
+        switch agentId?.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case TurnThreadAgentOption.claude.rawValue:
+            return .claude
+        default:
+            return .codex
+        }
+    }
+}
+
 struct TurnToolbarContent: ToolbarContent {
     let displayTitle: String
     let navigationContext: TurnThreadNavigationContext?
@@ -215,10 +249,16 @@ private struct ResizableThreadActionSymbol: View {
 struct TurnThreadPathSheet: View {
     let context: TurnThreadNavigationContext
     let threadTitle: String
+    let currentAgentId: String?
+    let isAgentControlEnabled: Bool
     var onRenameThread: ((String) -> Void)? = nil
+    var onUpdateThreadAgent: ((String) async throws -> Void)? = nil
 
     @State private var renamePrompt = ThreadRenamePromptState()
     @State private var didCopyPath = false
+    @State private var selectedAgent = TurnThreadAgentOption.codex
+    @State private var isUpdatingAgent = false
+    @State private var agentUpdateErrorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -249,6 +289,36 @@ struct TurnThreadPathSheet: View {
                                 }
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("Rename conversation")
+                            }
+                        }
+                    }
+
+                    if onUpdateThreadAgent != nil {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(alignment: .center, spacing: 8) {
+                                Text("Agent")
+                                    .font(AppFont.caption(weight: .semibold))
+                                    .foregroundStyle(.secondary)
+
+                                if isUpdatingAgent {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
+                            }
+
+                            Picker("Agent", selection: agentSelectionBinding) {
+                                ForEach(TurnThreadAgentOption.allCases) { option in
+                                    RemodexIcon.label(option.title, systemName: option.systemName)
+                                        .tag(option)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .disabled(!isAgentControlEnabled || isUpdatingAgent)
+
+                            if let agentUpdateErrorMessage {
+                                Text(agentUpdateErrorMessage)
+                                    .font(AppFont.caption())
+                                    .foregroundStyle(.red)
                             }
                         }
                     }
@@ -296,9 +366,48 @@ struct TurnThreadPathSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .adaptiveNavigationBar()
         }
-        .presentationDetents([.fraction(0.4), .medium])
+        .presentationDetents([.fraction(0.45), .medium])
+        .onAppear {
+            selectedAgent = TurnThreadAgentOption.resolved(from: currentAgentId)
+        }
+        .onChange(of: currentAgentId) { _, newValue in
+            guard !isUpdatingAgent else { return }
+            selectedAgent = TurnThreadAgentOption.resolved(from: newValue)
+        }
         .threadRenamePrompt(state: $renamePrompt) { newTitle in
             onRenameThread?(newTitle)
+        }
+    }
+
+    private var agentSelectionBinding: Binding<TurnThreadAgentOption> {
+        Binding(
+            get: { selectedAgent },
+            set: { newSelection in
+                guard newSelection != selectedAgent else { return }
+                let previousSelection = selectedAgent
+                selectedAgent = newSelection
+                agentUpdateErrorMessage = nil
+                HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                updateAgent(to: newSelection, revertingTo: previousSelection)
+            }
+        )
+    }
+
+    private func updateAgent(to selection: TurnThreadAgentOption, revertingTo previousSelection: TurnThreadAgentOption) {
+        guard let onUpdateThreadAgent else { return }
+
+        isUpdatingAgent = true
+        Task { @MainActor in
+            do {
+                try await onUpdateThreadAgent(selection.rawValue)
+            } catch {
+                selectedAgent = previousSelection
+                agentUpdateErrorMessage = error.localizedDescription.isEmpty
+                    ? "Could not update the thread agent."
+                    : error.localizedDescription
+            }
+
+            isUpdatingAgent = false
         }
     }
 

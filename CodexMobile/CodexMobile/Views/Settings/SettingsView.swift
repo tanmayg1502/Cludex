@@ -15,6 +15,7 @@ struct SettingsView: View {
             SettingsAppearanceCard(appFontStyle: appFontStyleBinding)
             SettingsNotificationsCard()
             SettingsGPTAccountCard()
+            SettingsClaudeAccountCard()
             SettingsClaudeDefaultsCard()
             SettingsSubscriptionCard()
             SettingsBridgeVersionCard()

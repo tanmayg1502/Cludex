@@ -46,6 +46,60 @@ final class CodexThreadProjectRoutingTests: XCTestCase {
         XCTAssertEqual(service.activeThreadId, "thread-new")
     }
 
+    func testUpdateThreadAgentSendsThreadUpdateAndCommitsLocalAgentAfterSuccess() async throws {
+        let service = makeService()
+        service.upsertThread(CodexThread(id: "thread-1", title: "Agent Thread"))
+
+        var capturedParams: [String: JSONValue] = [:]
+        service.requestTransportOverride = { method, params in
+            XCTAssertEqual(method, "thread/update")
+            capturedParams = params?.objectValue ?? [:]
+            return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        }
+
+        let updatedThread = try await service.updateThreadAgent(threadId: "thread-1", agentId: "claude-code")
+
+        XCTAssertEqual(capturedParams["threadId"]?.stringValue, "thread-1")
+        XCTAssertEqual(capturedParams["agentId"]?.stringValue, "claude-code")
+        XCTAssertEqual(capturedParams.count, 2)
+        XCTAssertEqual(updatedThread.agentId, "claude-code")
+        XCTAssertEqual(service.thread(for: "thread-1")?.agentId, "claude-code")
+    }
+
+    func testUpdatedThreadAgentIsIncludedInNextTurnStart() async throws {
+        let service = makeService()
+        service.upsertThread(CodexThread(id: "thread-1", title: "Agent Thread"))
+        service.resumedThreadIDs.insert("thread-1")
+
+        var turnStartParams: [String: JSONValue] = [:]
+        service.requestTransportOverride = { method, params in
+            switch method {
+            case "thread/update":
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            case "turn/start":
+                turnStartParams = params?.objectValue ?? [:]
+                return RPCMessage(
+                    id: .string(UUID().uuidString),
+                    result: .object(["turnId": .string("turn-1")]),
+                    includeJSONRPC: false
+                )
+            default:
+                XCTFail("Unexpected method \(method)")
+                return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+            }
+        }
+
+        try await service.updateThreadAgent(threadId: "thread-1", agentId: "codex")
+        try await service.startTurn(
+            userInput: "next",
+            threadId: "thread-1",
+            shouldAppendUserMessage: false
+        )
+
+        XCTAssertEqual(turnStartParams["threadId"]?.stringValue, "thread-1")
+        XCTAssertEqual(turnStartParams["agentId"]?.stringValue, "codex")
+    }
+
     func testMoveThreadToProjectPathKeepsRebindWhenResumeFailsOnlyBecauseRolloutIsMissing() async throws {
         let service = makeService()
         let originalThread = CodexThread(

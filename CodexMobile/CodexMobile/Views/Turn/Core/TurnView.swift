@@ -401,8 +401,21 @@ struct TurnView: View {
                 TurnThreadPathSheet(
                     context: context,
                     threadTitle: resolvedThread.displayTitle,
+                    currentAgentId: resolvedThread.agentId,
+                    isAgentControlEnabled: codex.isConnected,
                     onRenameThread: { newName in
                         codex.renameThread(thread.id, name: newName)
+                    },
+                    onUpdateThreadAgent: { agentId in
+                        do {
+                            try await codex.updateThreadAgent(threadId: thread.id, agentId: agentId)
+                        } catch {
+                            if let message = codex.userFacingTurnErrorMessageForFooter(from: error),
+                               codex.lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+                                codex.lastErrorMessage = message
+                            }
+                            throw error
+                        }
                     }
                 )
             }

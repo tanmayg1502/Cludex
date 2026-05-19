@@ -214,6 +214,42 @@ final class CodexThreadRuntimeOverrideTests: XCTestCase {
         XCTAssertTrue(service.initialTurnsLoadedByThreadID.contains("thread-new"))
     }
 
+    func testStartClaudeThreadUsesClaudeDefaultsInThreadStartParams() async throws {
+        let service = makeService()
+        service.isConnected = true
+        service.availableModels = [makeModel()]
+        service.setSelectedModelId("gpt-5.4")
+        service.defaults.set("claude-opus-4-7", forKey: CodexClaudeDefaults.defaultModelDefaultsKey)
+        service.defaults.set("bypassPermissions", forKey: CodexClaudeDefaults.permissionModeDefaultsKey)
+        service.defaults.set(120, forKey: CodexClaudeDefaults.permissionTimeoutSecsDefaultsKey)
+
+        var capturedThreadStartParams: [JSONValue] = []
+        service.requestTransportOverride = { method, params in
+            XCTAssertEqual(method, "thread/start")
+            capturedThreadStartParams.append(params ?? .null)
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([
+                    "thread": .object([
+                        "id": .string("thread-claude"),
+                        "cwd": .string("/tmp/project"),
+                        "agentId": .string("claude-code"),
+                    ]),
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        let thread = try await service.startThread(agentId: "claude-code")
+        let payload = capturedThreadStartParams.first?.objectValue
+
+        XCTAssertEqual(thread.id, "thread-claude")
+        XCTAssertEqual(payload?["agentId"]?.stringValue, "claude-code")
+        XCTAssertEqual(payload?["model"]?.stringValue, "claude-opus-4-7")
+        XCTAssertEqual(payload?["permissionMode"]?.stringValue, "bypassPermissions")
+        XCTAssertNil(payload?["permissionTimeoutSecs"])
+    }
+
     func testStartThreadDropsFastRuntimeOverrideWhenSelectedModelDoesNotSupportFastMode() async throws {
         let service = makeService()
         service.isConnected = true

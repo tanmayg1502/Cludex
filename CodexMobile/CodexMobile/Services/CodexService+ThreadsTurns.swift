@@ -15,6 +15,92 @@ private enum ThreadListHydrationPolicy {
     static let requestTimeoutNanoseconds: UInt64 = 12_000_000_000
 }
 
+enum CodexClaudeDefaults {
+    static let agentId = "claude-code"
+    static let defaultModelDefaultsKey = "claude.defaultModel"
+    static let permissionModeDefaultsKey = "claude.permissionMode"
+    static let permissionTimeoutSecsDefaultsKey = "claude.permissionTimeoutSecs"
+    static let defaultModel = "claude-sonnet-4-6"
+    static let defaultPermissionMode = "acceptEdits"
+    static let defaultPermissionTimeoutSecs = 30
+
+    static func isClaudeAgent(_ agentId: String?) -> Bool {
+        agentId?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == Self.agentId
+    }
+
+    static func model(from defaults: UserDefaults) -> String {
+        normalizedModel(defaults.string(forKey: defaultModelDefaultsKey))
+    }
+
+    static func permissionMode(from defaults: UserDefaults) -> String {
+        normalizedPermissionMode(defaults.string(forKey: permissionModeDefaultsKey))
+    }
+
+    static func permissionTimeoutSecs(from defaults: UserDefaults) -> Int {
+        guard defaults.object(forKey: permissionTimeoutSecsDefaultsKey) != nil else {
+            return defaultPermissionTimeoutSecs
+        }
+        return normalizedPermissionTimeoutSecs(defaults.integer(forKey: permissionTimeoutSecsDefaultsKey))
+    }
+
+    static func threadStartDefaults(
+        from defaults: UserDefaults,
+        agentId: String?
+    ) -> (modelIdentifier: String, permissionMode: String)? {
+        guard isClaudeAgent(agentId) else {
+            return nil
+        }
+
+        return (
+            modelIdentifier: model(from: defaults),
+            permissionMode: permissionMode(from: defaults)
+        )
+    }
+
+    static func bridgePreferencesPayload(
+        model: String,
+        permissionMode: String,
+        permissionTimeoutSecs: Int,
+        keepMacAwake: Bool
+    ) -> RPCObject {
+        [
+            "keepMacAwake": .bool(keepMacAwake),
+            "claudeCodeDefaultModel": .string(normalizedModel(model)),
+            "claudeCodeDefaultPermissionMode": .string(normalizedPermissionMode(permissionMode)),
+            "permissionTimeoutSecs": .integer(normalizedPermissionTimeoutSecs(permissionTimeoutSecs)),
+        ]
+    }
+
+    static func normalizedModel(_ rawValue: String?) -> String {
+        let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard trimmed.hasPrefix("claude-") else {
+            return defaultModel
+        }
+        return trimmed
+    }
+
+    static func normalizedPermissionMode(_ rawValue: String?) -> String {
+        let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        switch trimmed {
+        case "acceptEdits", "bypassPermissions":
+            return trimmed
+        default:
+            return defaultPermissionMode
+        }
+    }
+
+    static func normalizedPermissionTimeoutSecs(_ rawValue: Int) -> Int {
+        switch rawValue {
+        case 10, 30, 60, 120:
+            return rawValue
+        default:
+            return defaultPermissionTimeoutSecs
+        }
+    }
+}
+
 extension CodexService {
     // Sidebar loads stay capped so reconnect/bootstrap cannot pull an entire local history at once.
     var recentActiveThreadListLimit: Int { 70 }
@@ -62,7 +148,10 @@ extension CodexService {
 
     // Preserves arrival order while replacing retried copies of the same request id.
     func enqueuePendingApproval(_ request: CodexApprovalRequest) {
-        if let existingIndex = pendingApprovals.firstIndex(where: { $0.id == request.id }) {
+        if let existingIndex = pendingApprovals.firstIndex(where: { pendingRequest in
+            pendingRequest.id == request.id
+                || (pendingRequest.permissionId == request.permissionId && request.permissionId != nil)
+        }) {
             pendingApprovals[existingIndex] = request
             return
         }
@@ -73,13 +162,51 @@ extension CodexService {
     // Removes the exact resolved approval request when the server confirms it is gone.
     @discardableResult
     func removePendingApproval(requestID: JSONValue) -> CodexApprovalRequest? {
-        let requestKey = idKey(from: requestID)
-        return removePendingApproval(id: requestKey)
+        removePendingApproval(requestID: requestID, permissionId: nil)
+    }
+
+    @discardableResult
+    func removePendingApproval(requestID: JSONValue?, permissionId: String?) -> CodexApprovalRequest? {
+        let requestKey = requestID.map { idKey(from: $0) }
+        return removePendingApproval(requestKey: requestKey, permissionId: permissionId)
     }
 
     // Clears all volatile approval prompts on disconnect or server switch.
     func clearPendingApprovals() {
         pendingApprovals.removeAll()
+    }
+
+    func syncBridgeClaudeDefaultsPreferenceIfNeeded(
+        model: String,
+        permissionMode: String,
+        permissionTimeoutSecs: Int,
+        showFailureInUI: Bool = false
+    ) async {
+        guard isConnected else {
+            return
+        }
+
+        let params = CodexClaudeDefaults.bridgePreferencesPayload(
+            model: model,
+            permissionMode: permissionMode,
+            permissionTimeoutSecs: permissionTimeoutSecs,
+            keepMacAwake: keepMacAwakeWhileBridgeRuns
+        )
+
+        do {
+            let response = try await sendRequest(
+                method: "desktop/preferences/update",
+                params: .object(params)
+            )
+            guard let resultObject = response.result?.objectValue,
+                  resultObject["success"]?.boolValue == true else {
+                throw DesktopHandoffError.invalidResponse
+            }
+        } catch {
+            if showFailureInUI {
+                lastErrorMessage = userFacingTurnErrorMessageForFooter(from: error)
+            }
+        }
     }
 
     func listThreads(limit: Int? = nil) async throws {
@@ -157,6 +284,7 @@ extension CodexService {
         agentId: String? = nil
     ) async throws -> CodexThread {
         let normalizedPreferredProjectPath = CodexThreadStartProjectBinding.normalizedProjectPath(preferredProjectPath)
+        let claudeDefaults = CodexClaudeDefaults.threadStartDefaults(from: defaults, agentId: agentId)
         // Brand-new chats start from app defaults; per-chat overrides are inherited only on continuation.
         let explicitServiceTier = runtimeOverride?.overridesServiceTier == true
             ? normalizedServiceTierForSelectedModel(runtimeOverride?.serviceTier)?.rawValue
@@ -165,10 +293,11 @@ extension CodexService {
 
         while true {
             let params = CodexThreadStartProjectBinding.makeThreadStartParams(
-                modelIdentifier: runtimeModelIdentifierForTurn(),
+                modelIdentifier: claudeDefaults?.modelIdentifier ?? runtimeModelIdentifierForTurn(),
                 preferredProjectPath: normalizedPreferredProjectPath,
                 serviceTier: includesServiceTier ? explicitServiceTier : nil,
-                agentId: agentId
+                agentId: agentId,
+                permissionMode: claudeDefaults?.permissionMode
             )
 
             do {
@@ -246,6 +375,42 @@ extension CodexService {
 
     func persistComposerDrafts() {
         composerDraftPersistence.save(composerDraftsByThreadID)
+    }
+
+    // Updates the agent routing for an existing thread and commits it locally only after the runtime accepts it.
+    @discardableResult
+    func updateThreadAgent(threadId: String, agentId: String) async throws -> CodexThread {
+        let normalizedThreadId = threadId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedAgentId = agentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadId.isEmpty else {
+            throw CodexServiceError.invalidInput("Thread id is required.")
+        }
+        guard normalizedAgentId == "codex" || normalizedAgentId == "claude-code" else {
+            throw CodexServiceError.invalidInput("Unsupported agent.")
+        }
+        guard var currentThread = thread(for: normalizedThreadId) else {
+            throw CodexServiceError.invalidInput("Thread not found.")
+        }
+
+        let response = try await sendRequest(
+            method: "thread/update",
+            params: .object([
+                "threadId": .string(normalizedThreadId),
+                "agentId": .string(normalizedAgentId),
+            ])
+        )
+
+        if let updatedThread = decodeThreadUpdateResponse(from: response.result) {
+            var resolvedThread = updatedThread
+            resolvedThread.agentId = normalizedAgentId
+            upsertThread(resolvedThread, treatAsServerState: true)
+        } else {
+            currentThread.agentId = normalizedAgentId
+            currentThread.updatedAt = Date()
+            upsertThread(currentThread)
+        }
+
+        return thread(for: normalizedThreadId) ?? currentThread
     }
 
     // Sends user input as a new turn against an existing (or newly created) thread.
@@ -589,7 +754,7 @@ extension CodexService {
             id: request.requestID,
             result: approvalResponseResult(for: request, decision: "accept", forSession: forSession)
         )
-        removePendingApproval(requestID: request.requestID)
+        removePendingApproval(requestID: request.requestID, permissionId: request.permissionId)
     }
 
     // Accepts the next pending approval request, optionally scoped to a thread.
@@ -612,7 +777,7 @@ extension CodexService {
             id: request.requestID,
             result: approvalResponseResult(for: request, decision: "decline")
         )
-        removePendingApproval(requestID: request.requestID)
+        removePendingApproval(requestID: request.requestID, permissionId: request.permissionId)
     }
 
     // Declines the next pending approval request, optionally scoped to a thread.
@@ -760,9 +925,35 @@ extension CodexService {
 }
 
 private extension CodexService {
+    func decodeThreadUpdateResponse(from result: JSONValue?) -> CodexThread? {
+        guard let result else { return nil }
+
+        if let resultObject = result.objectValue,
+           let threadValue = resultObject["thread"],
+           let decodedThread = decodeModel(CodexThread.self, from: threadValue) {
+            return decodedThread
+        }
+
+        return decodeModel(CodexThread.self, from: result)
+    }
+
     @discardableResult
-    func removePendingApproval(id requestID: String) -> CodexApprovalRequest? {
-        guard let exactIndex = pendingApprovals.firstIndex(where: { $0.id == requestID }) else {
+    func removePendingApproval(requestKey: String?, permissionId: String?) -> CodexApprovalRequest? {
+        guard requestKey != nil || permissionId != nil else {
+            return nil
+        }
+
+        guard let exactIndex = pendingApprovals.firstIndex(where: { request in
+            if let requestKey, request.id == requestKey {
+                return true
+            }
+
+            if let permissionId, request.permissionId == permissionId {
+                return true
+            }
+
+            return false
+        }) else {
             return nil
         }
 
@@ -789,7 +980,8 @@ enum CodexThreadStartProjectBinding {
         modelIdentifier: String?,
         preferredProjectPath: String?,
         serviceTier: String?,
-        agentId: String? = nil
+        agentId: String? = nil,
+        permissionMode: String? = nil
     ) -> RPCObject {
         var params: RPCObject = [:]
 
@@ -807,6 +999,10 @@ enum CodexThreadStartProjectBinding {
 
         if let agentId, !agentId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             params["agentId"] = .string(agentId.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        if let permissionMode, !permissionMode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["permissionMode"] = .string(permissionMode.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
         return params

@@ -147,6 +147,100 @@ final class CodexApprovalStateTests: XCTestCase {
         XCTAssertEqual(service.pendingApproval(for: "thread-a")?.id, service.idKey(from: approvalRequestID))
     }
 
+    func testIncomingApprovalRequestCapturesPermissionIdWithoutReplacingRequestId() throws {
+        let service = makeService()
+        let requestID: JSONValue = .string("approval-rpc-1")
+
+        service.handleIncomingRPCMessage(
+            RPCMessage(
+                id: requestID,
+                method: "item/permissions/requestApproval",
+                params: .object([
+                    "threadId": .string("thread-a"),
+                    "turnId": .string("turn-a"),
+                    "permissionId": .string("permission-1"),
+                    "permissions": .object([
+                        "network": .object(["enabled": .bool(true)]),
+                    ]),
+                ]),
+                includeJSONRPC: false
+            )
+        )
+
+        let request = try XCTUnwrap(service.pendingApproval(for: "thread-a"))
+        XCTAssertEqual(request.id, service.idKey(from: requestID))
+        XCTAssertEqual(request.requestID, requestID)
+        XCTAssertEqual(request.permissionId, "permission-1")
+    }
+
+    func testApprovalTimeoutRemovesMatchingPermissionIdAndShowsNotice() {
+        let service = makeService()
+
+        service.handleIncomingRPCMessage(
+            RPCMessage(
+                id: .string("approval-rpc-1"),
+                method: "item/permissions/requestApproval",
+                params: .object([
+                    "threadId": .string("thread-a"),
+                    "turnId": .string("turn-a"),
+                    "permissionId": .string("permission-1"),
+                ]),
+                includeJSONRPC: false
+            )
+        )
+        service.handleIncomingRPCMessage(
+            RPCMessage(
+                id: .string("approval-rpc-2"),
+                method: "item/permissions/requestApproval",
+                params: .object([
+                    "threadId": .string("thread-b"),
+                    "turnId": .string("turn-b"),
+                    "permissionId": .string("permission-2"),
+                ]),
+                includeJSONRPC: false
+            )
+        )
+
+        service.handleNotification(
+            method: "approval/timeout",
+            params: .object([
+                "permissionId": .string("permission-1"),
+            ])
+        )
+
+        XCTAssertEqual(service.pendingApprovals.count, 1)
+        XCTAssertNil(service.pendingApproval(for: "thread-a"))
+        XCTAssertEqual(service.pendingApproval(for: "thread-b")?.permissionId, "permission-2")
+        XCTAssertEqual(service.lastErrorMessage, "Claude approval timed out.")
+    }
+
+    func testApprovalTimeoutFallsBackToRequestIdRemoval() {
+        let service = makeService()
+        let requestID: JSONValue = .string("approval-rpc-1")
+
+        service.handleIncomingRPCMessage(
+            RPCMessage(
+                id: requestID,
+                method: "item/commandExecution/requestApproval",
+                params: .object([
+                    "threadId": .string("thread-a"),
+                    "turnId": .string("turn-a"),
+                ]),
+                includeJSONRPC: false
+            )
+        )
+
+        service.handleNotification(
+            method: "approval/timeout",
+            params: .object([
+                "requestId": requestID,
+            ])
+        )
+
+        XCTAssertTrue(service.pendingApprovals.isEmpty)
+        XCTAssertEqual(service.lastErrorMessage, "Claude approval timed out.")
+    }
+
     func testFailedApproveKeepsApprovalQueued() async {
         let service = makeService()
         let requestID: JSONValue = .string("approval-1")

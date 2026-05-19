@@ -1,7 +1,7 @@
 // FILE: CodexService+Account.swift
-// Purpose: Owns ChatGPT account state, browser-login lifecycle, and sanitized bridge refreshes.
+// Purpose: Owns ChatGPT and Claude account state, browser-login lifecycle, and sanitized bridge refreshes.
 // Layer: Service
-// Exports: CodexGPTAccountSnapshot, CodexGPTLoginState, CodexService GPT account helpers
+// Exports: CodexGPTAccountSnapshot, CodexClaudeAccountSnapshot, CodexGPTLoginState, CodexService account helpers
 // Depends on: Foundation, RPCMessage, JSONValue
 
 import Foundation
@@ -22,6 +22,14 @@ enum CodexGPTAccountStatus: String, Codable, Sendable {
 
 enum CodexGPTAuthMethod: String, Codable, Sendable {
     case chatgpt
+}
+
+enum CodexClaudeAccountStatus: String, Codable, Sendable {
+    case unknown
+    case unavailable
+    case notLoggedIn
+    case loginPending
+    case authenticated
 }
 
 struct CodexGPTAccountSnapshot: Codable, Equatable, Sendable {
@@ -97,6 +105,41 @@ struct CodexGPTAccountSnapshot: Codable, Equatable, Sendable {
         formatter.timeStyle = .short
         return formatter
     }()
+}
+
+struct CodexClaudeAccountSnapshot: Codable, Equatable, Sendable {
+    var status: CodexClaudeAccountStatus
+    var email: String?
+    var loginInFlight: Bool
+    var loginRequired: Bool
+    var updatedAt: Date
+
+    var isAuthenticated: Bool {
+        status == .authenticated
+    }
+
+    var statusLabel: String {
+        switch status {
+        case .unknown:
+            return "Unknown"
+        case .unavailable:
+            return "Unavailable"
+        case .notLoggedIn:
+            return "Not connected"
+        case .loginPending:
+            return "Signing in"
+        case .authenticated:
+            return "Connected"
+        }
+    }
+
+    var detailText: String? {
+        guard let email,
+              !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return email
+    }
 }
 
 enum CodexBridgeHostPlatform: String, Codable, Sendable {
@@ -184,6 +227,16 @@ nonisolated func codexGPTAccountInitialSnapshot() -> CodexGPTAccountSnapshot {
     )
 }
 
+nonisolated func codexClaudeAccountInitialSnapshot() -> CodexClaudeAccountSnapshot {
+    CodexClaudeAccountSnapshot(
+        status: .unknown,
+        email: nil,
+        loginInFlight: false,
+        loginRequired: true,
+        updatedAt: .distantPast
+    )
+}
+
 struct CodexGPTLoginState: Codable, Equatable, Sendable {
     let loginId: String
     let authURL: String
@@ -210,6 +263,7 @@ extension CodexService {
     func refreshBridgeManagedState(allowAvailableBridgeUpdatePrompt: Bool = false) async {
         guard isConnected else {
             applyGPTAccountConnectionFallback()
+            applyClaudeAccountConnectionFallback()
             return
         }
 
@@ -230,6 +284,7 @@ extension CodexService {
     func refreshGPTAccountState() async {
         guard isConnected else {
             applyGPTAccountConnectionFallback()
+            applyClaudeAccountConnectionFallback()
             return
         }
 
@@ -238,6 +293,21 @@ extension CodexService {
             applyBridgeManagedAccountSnapshot(from: bridgeState.payload)
         } catch {
             handleBridgeManagedAccountRefreshFailure()
+        }
+    }
+
+    // Refreshes the bridge-owned Claude account snapshot without ever fetching Claude tokens on iPhone.
+    func refreshClaudeAccountState() async {
+        guard isConnected else {
+            applyClaudeAccountConnectionFallback()
+            return
+        }
+
+        do {
+            let bridgeState = try await fetchBridgeManagedStatusSnapshot()
+            applyBridgeManagedAccountSnapshot(from: bridgeState.payload)
+        } catch {
+            applyClaudeAccountRefreshFailure(error)
         }
     }
 
@@ -534,6 +604,33 @@ extension CodexService {
         gptAccountLoginSyncTask?.cancel()
         gptAccountLoginSyncTask = nil
     }
+
+    @discardableResult
+    func startClaudeLogin(
+        pollIntervalNanoseconds: UInt64 = 3_000_000_000,
+        timeoutNanoseconds: UInt64 = 120_000_000_000
+    ) async throws -> CodexClaudeAccountSnapshot {
+        guard isConnected else {
+            throw CodexServiceError.disconnected
+        }
+
+        applyClaudeAccountSnapshot(pendingClaudeLoginSnapshot(retaining: claudeAccountSnapshot))
+        claudeAccountErrorMessage = nil
+
+        do {
+            _ = try await sendRequest(method: "claude/login/start", params: nil)
+            return try await pollClaudeLoginStatusUntilAuthenticated(
+                pollIntervalNanoseconds: pollIntervalNanoseconds,
+                timeoutNanoseconds: timeoutNanoseconds
+            )
+        } catch {
+            if !claudeAccountSnapshot.isAuthenticated {
+                applyClaudeAccountSnapshot(loggedOutClaudeAccountSnapshot(retaining: claudeAccountSnapshot))
+            }
+            claudeAccountErrorMessage = error.localizedDescription
+            throw error
+        }
+    }
 }
 
 // Split-file storage helpers stay service-internal so CodexService.swift can restore/persist GPT auth state.
@@ -541,6 +638,7 @@ extension CodexService {
     static let gptAccountSnapshotDefaultsKey = "codex.gpt.accountSnapshot"
     static let gptPendingLoginStateDefaultsKey = "codex.gpt.pendingLoginState"
     static let gptPendingLoginCallbackDefaultsKey = "codex.gpt.pendingLoginCallbackState"
+    static let claudeAccountSnapshotDefaultsKey = "codex.claude.accountSnapshot"
 
     var gptPendingLoginState: CodexGPTLoginState? {
         get {
@@ -625,6 +723,26 @@ extension CodexService {
         defaults.set(data, forKey: Self.gptAccountSnapshotDefaultsKey)
     }
 
+    func loadPersistedClaudeAccountSnapshot() -> CodexClaudeAccountSnapshot? {
+        guard let data = defaults.data(forKey: Self.claudeAccountSnapshotDefaultsKey),
+              var snapshot = try? decoder.decode(CodexClaudeAccountSnapshot.self, from: data) else {
+            return nil
+        }
+        snapshot.loginInFlight = false
+        if snapshot.status == .loginPending {
+            snapshot.status = .notLoggedIn
+            snapshot.loginRequired = true
+        }
+        return snapshot
+    }
+
+    func persistClaudeAccountSnapshot(_ snapshot: CodexClaudeAccountSnapshot) {
+        guard let data = try? encoder.encode(snapshot) else {
+            return
+        }
+        defaults.set(data, forKey: Self.claudeAccountSnapshotDefaultsKey)
+    }
+
     func clearGPTLoginState() {
         gptPendingLoginState = nil
         stopGPTLoginSync()
@@ -671,6 +789,18 @@ extension CodexService {
         syncPendingGPTLoginStateIfNeeded()
     }
 
+    func applyClaudeAccountSnapshot(_ snapshot: CodexClaudeAccountSnapshot) {
+        var resolvedSnapshot = snapshot
+        if resolvedSnapshot.status == .authenticated {
+            resolvedSnapshot.loginInFlight = false
+            resolvedSnapshot.loginRequired = false
+        } else if resolvedSnapshot.loginInFlight {
+            resolvedSnapshot.status = .loginPending
+        }
+        resolvedSnapshot.updatedAt = .now
+        claudeAccountSnapshot = resolvedSnapshot
+    }
+
     private func fetchBridgeManagedStatusSnapshot() async throws -> (
         payload: IncomingParamsObject,
         allowMissingVersionPrompt: Bool
@@ -699,12 +829,16 @@ extension CodexService {
     // Applies the bridge-owned ChatGPT snapshot after a shared managed-status fetch.
     private func applyBridgeManagedAccountSnapshot(from payloadObject: IncomingParamsObject) {
         applyGPTAccountSnapshot(decodeBridgeGPTAccountSnapshot(from: payloadObject))
+        applyClaudeAccountSnapshot(decodeBridgeClaudeAccountSnapshot(from: payloadObject))
         if currentPendingGPTLogin() != nil,
            (gptAccountSnapshot.hasActiveLogin || (gptAccountSnapshot.isAuthenticated && !gptAccountSnapshot.isVoiceTokenReady)) {
             startGPTLoginSyncIfNeeded()
         }
         if gptAccountSnapshot.isAuthenticated || gptAccountSnapshot.status == .notLoggedIn {
             gptAccountErrorMessage = nil
+        }
+        if claudeAccountSnapshot.isAuthenticated || claudeAccountSnapshot.status == .notLoggedIn {
+            claudeAccountErrorMessage = nil
         }
     }
 
@@ -766,6 +900,7 @@ extension CodexService {
         if gptAccountSnapshot.status == .unknown {
             gptAccountSnapshot = disconnectedGPTAccountSnapshot()
         }
+        applyClaudeAccountRefreshFailure(nil)
     }
 
     // Prompts for a bridge package upgrade once per session when bridge-managed status
@@ -1013,6 +1148,22 @@ extension CodexService {
         )
     }
 
+    func decodeBridgeClaudeAccountSnapshot(from payloadObject: IncomingParamsObject) -> CodexClaudeAccountSnapshot {
+        guard let claudeObject = payloadObject["claude"]?.objectValue else {
+            return unavailableClaudeAccountSnapshot(retaining: claudeAccountSnapshot)
+        }
+
+        return decodeClaudeAccountSnapshot(fromClaudeObject: claudeObject, retaining: claudeAccountSnapshot)
+    }
+
+    func decodeClaudeLoginStatusSnapshot(from response: RPCMessage) throws -> CodexClaudeAccountSnapshot {
+        guard let payloadObject = response.result?.objectValue else {
+            throw CodexServiceError.invalidResponse("claude/login/status response missing payload")
+        }
+
+        return decodeClaudeAccountSnapshot(fromClaudeObject: payloadObject, retaining: claudeAccountSnapshot)
+    }
+
     func decodeGPTLoginStartResult(from response: RPCMessage) throws -> CodexGPTLoginStartResult {
         guard let payloadObject = response.result?.objectValue else {
             throw CodexServiceError.invalidResponse("account/login/start response missing payload")
@@ -1096,6 +1247,120 @@ extension CodexService {
         )
     }
 
+    func pendingClaudeLoginSnapshot(retaining snapshot: CodexClaudeAccountSnapshot) -> CodexClaudeAccountSnapshot {
+        CodexClaudeAccountSnapshot(
+            status: .loginPending,
+            email: snapshot.email,
+            loginInFlight: true,
+            loginRequired: true,
+            updatedAt: .now
+        )
+    }
+
+    func unavailableClaudeAccountSnapshot(retaining snapshot: CodexClaudeAccountSnapshot) -> CodexClaudeAccountSnapshot {
+        CodexClaudeAccountSnapshot(
+            status: .unavailable,
+            email: snapshot.email,
+            loginInFlight: false,
+            loginRequired: true,
+            updatedAt: .now
+        )
+    }
+
+    func loggedOutClaudeAccountSnapshot(retaining snapshot: CodexClaudeAccountSnapshot) -> CodexClaudeAccountSnapshot {
+        CodexClaudeAccountSnapshot(
+            status: .notLoggedIn,
+            email: snapshot.email,
+            loginInFlight: false,
+            loginRequired: true,
+            updatedAt: .now
+        )
+    }
+
+    func applyClaudeAccountConnectionFallback() {
+        if claudeAccountSnapshot.status == .unknown {
+            claudeAccountSnapshot = unavailableClaudeAccountSnapshot(retaining: claudeAccountSnapshot)
+        }
+    }
+
+    func applyClaudeAccountRefreshFailure(_ error: Error?) {
+        if let error {
+            claudeAccountErrorMessage = error.localizedDescription
+        }
+        applyClaudeAccountConnectionFallback()
+    }
+
+    private func pollClaudeLoginStatusUntilAuthenticated(
+        pollIntervalNanoseconds: UInt64,
+        timeoutNanoseconds: UInt64
+    ) async throws -> CodexClaudeAccountSnapshot {
+        let startedAt = Date()
+        let timeoutSeconds = TimeInterval(timeoutNanoseconds) / 1_000_000_000
+
+        while !Task.isCancelled {
+            let response = try await sendRequest(method: "claude/login/status", params: nil)
+            let snapshot = try decodeClaudeLoginStatusSnapshot(from: response)
+            applyClaudeAccountSnapshot(snapshot)
+
+            if claudeAccountSnapshot.isAuthenticated {
+                claudeAccountErrorMessage = nil
+                return claudeAccountSnapshot
+            }
+
+            if Date().timeIntervalSince(startedAt) >= timeoutSeconds {
+                break
+            }
+
+            try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+        }
+
+        applyClaudeAccountSnapshot(
+            CodexClaudeAccountSnapshot(
+                status: .notLoggedIn,
+                email: claudeAccountSnapshot.email,
+                loginInFlight: false,
+                loginRequired: true,
+                updatedAt: .now
+            )
+        )
+        let message = "Claude sign-in timed out. Finish login on your Mac, then refresh this status."
+        claudeAccountErrorMessage = message
+        throw CodexServiceError.invalidResponse(message)
+    }
+
+    private func decodeClaudeAccountSnapshot(
+        fromClaudeObject claudeObject: IncomingParamsObject,
+        retaining existingSnapshot: CodexClaudeAccountSnapshot
+    ) -> CodexClaudeAccountSnapshot {
+        let authenticated = firstBoolValue(in: claudeObject, keys: ["authenticated", "loggedIn", "logged_in"]) ?? false
+        let loginRequired = firstBoolValue(in: claudeObject, keys: ["loginRequired", "login_required"]) ?? !authenticated
+        let explicitStatus = decodeClaudeAccountStatus(
+            from: firstStringValue(in: claudeObject, keys: ["status", "state"])
+        )
+        let bridgeReportedPendingLogin = firstBoolValue(in: claudeObject, keys: ["loginInFlight", "login_in_flight"]) ?? false
+
+        let resolvedStatus: CodexClaudeAccountStatus
+        if authenticated {
+            resolvedStatus = .authenticated
+        } else if bridgeReportedPendingLogin || existingSnapshot.loginInFlight {
+            resolvedStatus = .loginPending
+        } else if explicitStatus != .unknown {
+            resolvedStatus = explicitStatus
+        } else if loginRequired {
+            resolvedStatus = .notLoggedIn
+        } else {
+            resolvedStatus = .unknown
+        }
+
+        return CodexClaudeAccountSnapshot(
+            status: resolvedStatus,
+            email: firstStringValue(in: claudeObject, keys: ["email"]) ?? existingSnapshot.email,
+            loginInFlight: resolvedStatus == .loginPending,
+            loginRequired: resolvedStatus == .authenticated ? false : loginRequired,
+            updatedAt: .now
+        )
+    }
+
     func resolvedTokenReady(
         from payloadObject: IncomingParamsObject,
         status: CodexGPTAccountStatus,
@@ -1160,6 +1425,25 @@ extension CodexService {
             return .loginPending
         case "expired", "needs_reauth", "needsreauth", "reauth_required":
             return .expired
+        case "not_logged_in", "notloggedin", "signed_out", "logged_out", "unauthenticated":
+            return .notLoggedIn
+        case "unavailable", "offline":
+            return .unavailable
+        default:
+            return .unknown
+        }
+    }
+
+    func decodeClaudeAccountStatus(from value: String?) -> CodexClaudeAccountStatus {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return .unknown
+        }
+
+        switch value {
+        case "authenticated", "logged_in", "loggedin", "connected":
+            return .authenticated
+        case "loginpending", "login_pending", "pending", "pending_login":
+            return .loginPending
         case "not_logged_in", "notloggedin", "signed_out", "logged_out", "unauthenticated":
             return .notLoggedIn
         case "unavailable", "offline":
