@@ -234,6 +234,29 @@ enum SidebarThreadGrouping {
         }
     }
 
+    // Returns a multiAgentProgress badge for orchestration parent threads so the step count
+    // is visible in the sidebar without needing to open the thread.
+    // For non-orchestration threads, falls back to the caller-supplied badge state map unchanged.
+    // Completed step count is derived from children whose badge state is `.ready`.
+    static func resolvedRunBadgeState(
+        for thread: CodexThread,
+        in allThreads: [CodexThread],
+        runBadgeByThreadID: [String: CodexThreadRunBadgeState]
+    ) -> CodexThreadRunBadgeState? {
+        guard thread.agentId == "orchestration" else {
+            return runBadgeByThreadID[thread.id]
+        }
+
+        let children = allThreads.filter { $0.parentThreadId == thread.id }
+        guard !children.isEmpty else {
+            return runBadgeByThreadID[thread.id]
+        }
+
+        let total = children.count
+        let completed = children.filter { runBadgeByThreadID[$0.id] == .ready }.count
+        return .multiAgentProgress(completed: completed, total: total)
+    }
+
     private static func sortThreadsByRecentActivity(_ threads: [CodexThread]) -> [CodexThread] {
         threads.sorted { lhs, rhs in
             let lhsDate = lhs.updatedAt ?? lhs.createdAt ?? .distantPast

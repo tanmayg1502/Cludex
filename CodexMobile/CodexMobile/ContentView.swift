@@ -487,6 +487,20 @@ struct ContentView: View {
             },
             onOpenThread: { thread in
                 openThreadFromSidebar(thread)
+            },
+            onReconnect: {
+                Task {
+                    await viewModel.toggleConnection(codex: codex)
+                }
+            },
+            onScanNewPairing: {
+                presentManualScannerAfterStoppingReconnect()
+            },
+            onPairWithCode: {
+                presentManualPairingEntryAfterStoppingReconnect()
+            },
+            onForgetPair: {
+                codex.forgetReconnectCandidate()
             }
         )
     }
@@ -531,9 +545,9 @@ struct ContentView: View {
                     }
                 }
             ) {
-                EmptyView()
+                reconnectRecoveryActions
             } footer: {
-                EmptyView()
+                reconnectRecoveryFooter
             }
             .adaptiveNavigationBar()
         }
@@ -586,25 +600,9 @@ struct ContentView: View {
                     }
                 }
             ) {
-                if homeConnectionPhase == .connecting || (codex.hasReconnectCandidate && !codex.isConnected) {
-                    if shouldOfferWakeSavedMacDisplayAction {
-                        Button(isWakingSavedMacDisplay ? "Waking Screen..." : "Wake Screen") {
-                            wakeSavedMacDisplay()
-                        }
-                        .font(AppFont.subheadline(weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .buttonStyle(.plain)
-                        .disabled(isPreparingManualScanner || isWakingSavedMacDisplay)
-                    }
-
-                    if codex.hasReconnectCandidate {
-                        reconnectSecondaryActions
-                    }
-                }
+                reconnectRecoveryActions
             } footer: {
-                if codex.hasReconnectCandidate && !codex.isConnected {
-                    reconnectFooterAction
-                }
+                reconnectRecoveryFooter
             }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -1448,6 +1446,41 @@ struct ContentView: View {
             scannerCanReturnToOnboarding = false
             hasSeenOnboarding = false
         }
+    }
+
+    @ViewBuilder
+    private var reconnectRecoveryActions: some View {
+        if showsReconnectRecoveryActions {
+            if shouldOfferWakeSavedMacDisplayAction {
+                Button(isWakingSavedMacDisplay ? "Waking Screen..." : "Wake Screen") {
+                    wakeSavedMacDisplay()
+                }
+                .font(AppFont.subheadline(weight: .semibold))
+                .foregroundStyle(.primary)
+                .buttonStyle(.plain)
+                .disabled(isPreparingManualScanner || isWakingSavedMacDisplay)
+            }
+
+            if codex.hasSavedConnectionState {
+                reconnectSecondaryActions
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var reconnectRecoveryFooter: some View {
+        if shouldShowForgetPairAction {
+            reconnectFooterAction
+        }
+    }
+
+    private var showsReconnectRecoveryActions: Bool {
+        !codex.isConnected
+            && (homeConnectionPhase == .connecting || codex.hasSavedConnectionState)
+    }
+
+    private var shouldShowForgetPairAction: Bool {
+        codex.hasSavedConnectionState && !codex.isConnected
     }
 
     // Keeps QR and code recovery as one quiet secondary row under the main reconnect CTA.

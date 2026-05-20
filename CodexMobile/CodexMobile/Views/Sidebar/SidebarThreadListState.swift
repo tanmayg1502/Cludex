@@ -136,8 +136,34 @@ struct SidebarSubagentHierarchy {
             }
         }
 
+        // Sort children of orchestration parents by step-role canonical order so
+        // the planner → implementer → reviewer sequence is stable regardless of timestamp.
+        let sortedChildren = childrenByParentID.mapValues { children -> [CodexThread] in
+            let parentID = children.first?.parentThreadId
+            let parent = parentID.flatMap { threadsByID[$0] }
+            guard parent?.agentId == "orchestration" else {
+                return children
+            }
+            return children.sorted {
+                SidebarSubagentHierarchy.orchestrationStepOrder($0.agentRole) <
+                    SidebarSubagentHierarchy.orchestrationStepOrder($1.agentRole)
+            }
+        }
+
         self.rootThreads = rootThreads
-        self.childrenByParentID = childrenByParentID
+        self.childrenByParentID = sortedChildren
+    }
+
+    // Canonical step order for orchestration child threads.
+    // Lower index = appears first in the sidebar.
+    private static let orchestrationRoleOrder: [String] = [
+        "planner", "implementer", "coder", "reviewer", "validator"
+    ]
+
+    private static func orchestrationStepOrder(_ role: String?) -> Int {
+        guard let role else { return Int.max }
+        let lower = role.lowercased()
+        return orchestrationRoleOrder.firstIndex(of: lower) ?? Int.max - 1
     }
 }
 

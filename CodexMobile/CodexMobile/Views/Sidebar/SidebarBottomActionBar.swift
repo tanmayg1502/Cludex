@@ -16,6 +16,7 @@ struct SidebarBottomActionBar: View {
     let isCreatingThread: Bool
     let onTapChat: () -> Void
     let onTapTerminal: () -> Void
+    var onTapOrchestrate: (() -> Void)? = nil
 
     var body: some View {
         Group {
@@ -63,9 +64,25 @@ struct SidebarBottomActionBar: View {
             HStack(spacing: 10) {
                 terminalPill
                 Spacer(minLength: 0)
+                if let onTapOrchestrate {
+                    orchestrateGlassFAB(action: onTapOrchestrate)
+                }
                 chatGlassFAB
             }
         }
+    }
+
+    private func orchestrateGlassFAB(action: @escaping () -> Void) -> some View {
+        Button {
+            HapticFeedback.shared.triggerImpactFeedback(style: .light)
+            action()
+        } label: {
+            RemodexIcon.image(systemName: "list.bullet.rectangle.portrait", size: 20, weight: .semibold)
+        }
+        .adaptiveGlassButtonStyle(.regular)
+        .controlSize(.large)
+        .tint(.accentColor)
+        .accessibilityLabel("Orchestrate")
     }
 
     private var chatGlassFAB: some View {
@@ -97,8 +114,28 @@ struct SidebarBottomActionBar: View {
         HStack(spacing: 10) {
             terminalPill
             Spacer(minLength: 0)
+            if let onTapOrchestrate {
+                iOS18OrchestratePill(action: onTapOrchestrate)
+            }
             iOS18ChatPill
         }
+    }
+
+    private func iOS18OrchestratePill(action: @escaping () -> Void) -> some View {
+        Button {
+            HapticFeedback.shared.triggerImpactFeedback(style: .light)
+            action()
+        } label: {
+            ComposerPillLabel(
+                title: "Orchestrate",
+                iconSystemName: "list.bullet.rectangle.portrait",
+                titleFont: AppFont.mono(.subheadline),
+                titleWeight: .medium,
+                showsTrailingChevron: false
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Orchestrate")
     }
 
     private var iOS18ChatPill: some View {

@@ -124,6 +124,11 @@ struct SidebarThreadRowView: View {
                     .background(Color.orange.opacity(0.12), in: Capsule())
             }
 
+            // Multi-agent badge: shown for orchestration parent threads.
+            if thread.agentId == "orchestration" {
+                multiAgentBadge
+            }
+
             expansionToggleButton
 
             threadStatusIconSlot(pointSize: 12)
@@ -138,6 +143,20 @@ struct SidebarThreadRowView: View {
                     .lineLimit(1)
             }
         }
+    }
+
+    /// "Multi-agent" capsule badge shown for orchestration parent threads.
+    private var multiAgentBadge: some View {
+        HStack(spacing: 3) {
+            RemodexIcon.image(systemName: "square.stack.3d.up")
+                .font(AppFont.system(size: 9, weight: .semibold))
+            Text("Multi-agent")
+                .font(AppFont.caption2())
+        }
+        .foregroundStyle(.purple)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(Color.purple.opacity(0.12), in: Capsule())
     }
 
     // MARK: - Subagent row (CodexService isolated in SubagentNameLabel)
@@ -320,6 +339,12 @@ private enum SidebarRowPreviewFixtures {
         CodexThread(id: "t3", title: "Fix payment flow", createdAt: now.addingTimeInterval(-14400), updatedAt: now.addingTimeInterval(-1200), cwd: "/Users/dev/payments"),
         CodexThread(id: "t3_a", title: "Ford [planner]", createdAt: now.addingTimeInterval(-13000), updatedAt: now.addingTimeInterval(-1500), cwd: "/Users/dev/payments", parentThreadId: "t3", agentNickname: "Ford", agentRole: "planner"),
         CodexThread(id: "t4", title: "Stripe webhook retry logic", createdAt: now.addingTimeInterval(-86400), updatedAt: now.addingTimeInterval(-3600), cwd: "/Users/dev/payments"),
+
+        // ── Project 3: orchestration example ──
+        CodexThread(id: "orch1", title: "Migrate DB schema", createdAt: now.addingTimeInterval(-1800), updatedAt: now.addingTimeInterval(-30), cwd: "/Users/dev/payments", agentId: "orchestration"),
+        CodexThread(id: "orch1_plan", title: "Planner", createdAt: now.addingTimeInterval(-1700), updatedAt: now.addingTimeInterval(-120), cwd: "/Users/dev/payments", parentThreadId: "orch1", agentRole: "planner"),
+        CodexThread(id: "orch1_impl", title: "Implementer", createdAt: now.addingTimeInterval(-1600), updatedAt: now.addingTimeInterval(-90), cwd: "/Users/dev/payments", parentThreadId: "orch1", agentRole: "implementer"),
+        CodexThread(id: "orch1_rev", title: "Reviewer", createdAt: now.addingTimeInterval(-1500), updatedAt: now.addingTimeInterval(-60), cwd: "/Users/dev/payments", parentThreadId: "orch1", agentRole: "reviewer"),
     ]
 
     static let groups: [SidebarThreadGroup] = [
@@ -346,6 +371,8 @@ private enum SidebarRowPreviewFixtures {
         "t1_a": .running,
         "t1_b": .ready,
         "t3": .ready,
+        "orch1_plan": .ready,
+        "orch1_impl": .running,
     ]
 
     static func timingLabel(for thread: CodexThread) -> String? {

@@ -65,6 +65,7 @@ const { createShortPairingCode, SHORT_PAIRING_CODE_LENGTH } = require("./qr");
 const {
   readThreadTurnsListPageFromSessionJsonl,
 } = require("./session-jsonl-history");
+const { handleOrchestrationRequest } = require("./orchestration-handler");
 
 const execFileAsync = promisify(execFile);
 const RELAY_WATCHDOG_PING_INTERVAL_MS = 10_000;
@@ -462,7 +463,8 @@ function startBridge({
     updatePendingAuthLoginFromCodexMessage(message);
     trackCodexHandshakeState(message);
     if (isClaudeOwnedMessage(message)) {
-      // Claude-originated messages skip Codex desktop integrations and push tracking.
+      // Claude messages still need push tracking, just not Codex desktop integration.
+      pushNotificationTracker.handleOutbound(message);
       rememberThreadFromMessage("claude", message);
     } else {
       desktopRefresher.handleOutbound(message);
@@ -524,6 +526,9 @@ function startBridge({
 
   // Routes decrypted app payloads through the same bridge handlers as before.
   function handleApplicationMessage(rawMessage) {
+    if (handleOrchestrationRequest(rawMessage, sendApplicationResponse, { router: codex })) {
+      return;
+    }
     if (handleBridgeManagedHandshakeMessage(rawMessage, sendApplicationResponse)) {
       return;
     }

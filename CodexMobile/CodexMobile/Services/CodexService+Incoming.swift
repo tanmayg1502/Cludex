@@ -304,6 +304,13 @@ extension CodexService {
         case "terminal/event":
             handleTerminalEvent(paramsObject)
 
+        case "orchestration/started",
+             "orchestration/step/started",
+             "orchestration/step/completed",
+             "orchestration/completed",
+             "orchestration/failed":
+            orchestrationService.handleOrchestrationNotification(method: method, params: params)
+
         default:
             if method.hasPrefix("codex/event/"),
                handleLegacyCodexNamedEvent(method: method, paramsObject: paramsObject) {

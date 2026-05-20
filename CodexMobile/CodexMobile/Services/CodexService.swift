@@ -206,6 +206,8 @@ enum CodexThreadRunBadgeState: Hashable, Sendable {
     case running
     case ready
     case failed
+    /// Orchestration parent: number of completed child steps out of total.
+    case multiAgentProgress(completed: Int, total: Int)
 }
 
 enum CodexRunCompletionResult: String, Equatable, Sendable {
@@ -686,6 +688,9 @@ final class CodexService {
     @ObservationIgnored var pendingSystemDeltasByKey: [String: PendingSystemStreamingDeltas] = [:]
     @ObservationIgnored var systemDeltaFlushTasksByKey: [String: Task<Void, Never>] = [:]
 
+    // Orchestration cross-agent run state.
+    var orchestrationService = OrchestrationService()
+
     let encoder: JSONEncoder
     let decoder: JSONDecoder
     let messagePersistence = CodexMessagePersistence()
@@ -1017,6 +1022,10 @@ final class CodexService {
 
     var hasReconnectCandidate: Bool {
         hasSavedRelaySession || hasTrustedMacReconnectCandidate
+    }
+
+    var hasSavedConnectionState: Bool {
+        hasSavedRelaySession || preferredTrustedMacDeviceId != nil
     }
 
     // Chooses the relay base URL only when a saved live session can actually carry a wake request.

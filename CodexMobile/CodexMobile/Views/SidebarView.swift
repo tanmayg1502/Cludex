@@ -23,6 +23,10 @@ struct SidebarView: View {
     let onOpenTerminal: () -> Void
     let onNewChatCreationStateChange: (Bool) -> Void
     let onOpenThread: (CodexThread) -> Void
+    let onReconnect: () -> Void
+    let onScanNewPairing: () -> Void
+    let onPairWithCode: () -> Void
+    let onForgetPair: () -> Void
 
     @State private var searchText = ""
     @State private var isCreatingThread = false
@@ -438,6 +442,118 @@ struct SidebarView: View {
         codex.isConnected && codex.isInitialized
     }
 
+    private var shouldShowConnectionRecovery: Bool {
+        !codex.isConnected
+    }
+
+    private var isConnecting: Bool {
+        switch codex.connectionPhase {
+        case .connecting, .loadingChats, .syncing:
+            return true
+        case .offline, .connected:
+            return false
+        }
+    }
+
+    private var sidebarConnectionRecoveryView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Circle()
+                    .fill(isConnecting ? Color.orange : Color(.tertiaryLabel))
+                    .frame(width: 8, height: 8)
+                    .padding(.top, 6)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(isConnecting ? "Reconnecting" : "Saved Computer")
+                        .font(AppFont.caption(weight: .semibold))
+                        .foregroundStyle(.secondary)
+
+                    Text(connectionRecoverySummary)
+                        .font(AppFont.subheadline(weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button(action: primaryConnectionRecoveryAction) {
+                HStack(spacing: 8) {
+                    if isConnecting {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
+                    Text(primaryConnectionRecoveryTitle)
+                        .font(AppFont.subheadline(weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .foregroundStyle(Color(.systemBackground))
+                .background(Color.primary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .disabled(isConnecting)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    Button("New QR Code", action: onScanNewPairing)
+                    Button("Pair with Code", action: onPairWithCode)
+                }
+
+                if codex.hasSavedConnectionState {
+                    Button("Forget Pair", role: .destructive, action: onForgetPair)
+                }
+            }
+            .font(AppFont.caption(weight: .semibold))
+            .foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(.secondarySystemBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private var connectionRecoverySummary: String {
+        if let error = codex.lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !error.isEmpty {
+            return error
+        }
+
+        if let name = codex.trustedPairPresentation?.name,
+           !name.isEmpty {
+            return "Connect to \(name), or pair with a fresh code."
+        }
+
+        if !codex.hasSavedConnectionState {
+            return "Scan the QR code from your Mac or enter the pairing code."
+        }
+
+        return "Connect to your saved Mac, or pair with a fresh code."
+    }
+
+    private var primaryConnectionRecoveryTitle: String {
+        if isConnecting {
+            return "Reconnecting..."
+        }
+
+        return codex.hasReconnectCandidate ? "Reconnect" : "Scan QR Code"
+    }
+
+    private func primaryConnectionRecoveryAction() {
+        if codex.hasReconnectCandidate {
+            onReconnect()
+        } else {
+            onScanNewPairing()
+        }
+    }
+
     // Wraps the thread list with the bottom action bar. `safeAreaInset` keeps
     // the glass controls in the hit-test tree; `safeAreaBar` could render the
     // iOS 26 bar while dropping taps from the Terminal pill inside the drawer.
@@ -449,6 +565,12 @@ struct SidebarView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
                     .padding(.bottom, 8)
+
+                if shouldShowConnectionRecovery {
+                    sidebarConnectionRecoveryView
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 12)
+                }
 
                 if SidebarThreadsLoadingPresentation.shouldShowInlineStatus(
                     isLoadingThreads: codex.isLoadingThreads,
@@ -525,7 +647,10 @@ struct SidebarView: View {
             isChatEnabled: canCreateThread,
             isCreatingThread: isCreatingThread,
             onTapChat: handleNewChatButtonTap,
-            onTapTerminal: openTerminal
+            onTapTerminal: openTerminal,
+            onTapOrchestrate: {
+                activeSidebarSheet = .orchestrationComposer
+            }
         )
     }
 
@@ -557,6 +682,7 @@ private extension SidebarView {
 private enum SidebarPresentedSheet: String, Identifiable {
     case newChatProjectPicker
     case localFolderBrowser
+    case orchestrationComposer
 
     var id: String { rawValue }
 }
@@ -593,6 +719,8 @@ private extension SidebarView {
                 activeSidebarSheet = nil
                 handleNewChatTap(preferredProjectPath: projectPath)
             }
+        case .orchestrationComposer:
+            OrchestrationComposerSheet()
         }
     }
 }

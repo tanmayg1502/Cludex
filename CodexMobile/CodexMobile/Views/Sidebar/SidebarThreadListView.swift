@@ -352,7 +352,11 @@ struct SidebarThreadListView: View {
         return SidebarThreadRowView(
             thread: thread,
             isSelected: isSelected,
-            runBadgeState: runBadgeStateByThreadID[thread.id],
+            runBadgeState: SidebarThreadGrouping.resolvedRunBadgeState(
+                for: thread,
+                in: threads,
+                runBadgeByThreadID: runBadgeStateByThreadID
+            ),
             timingLabel: timingLabelProvider(thread),
             isPinned: codex.isThreadPinned(thread.id),
             pinnedProjectLabel: isPinnedRow ? thread.projectDisplayName : nil,

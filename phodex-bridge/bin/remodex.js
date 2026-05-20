@@ -37,6 +37,17 @@ const defaultDeps = {
 };
 
 if (require.main === module) {
+  // Keep the bridge alive when third-party async code (e.g. the Claude Agent
+  // SDK spawning its native binary) throws into nothing. Without these, a
+  // single failed Claude turn can tear the whole process down and take the
+  // local relay with it, which makes orchestration runs appear to "hang"
+  // mid-step from the iOS side.
+  process.on("uncaughtException", (err) => {
+    console.error("[remodex] uncaughtException (kept alive):", err?.stack || err);
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error("[remodex] unhandledRejection (kept alive):", reason?.stack || reason);
+  });
   void runCli();
 }
 
