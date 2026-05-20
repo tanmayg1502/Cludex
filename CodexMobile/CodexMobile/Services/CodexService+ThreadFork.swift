@@ -40,6 +40,10 @@ extension CodexService {
             if supportsTurnPagination {
                 baseParams["excludeTurns"] = .bool(true)
             }
+            if sourceThread.agentId == "claude-code",
+               let resolvedProjectPath {
+                baseParams["cwd"] = .string(resolvedProjectPath)
+            }
             let response = try await sendRequestWithApprovalPolicyFallback(
                 method: "thread/fork",
                 baseParams: baseParams,
@@ -57,9 +61,14 @@ extension CodexService {
             return forkedThread
         } catch {
             if supportsTurnPagination, consumeUnsupportedTurnPagination(error) {
+                var fallbackParams: RPCObject = ["threadId": .string(normalizedSourceThreadId)]
+                if sourceThread.agentId == "claude-code",
+                   let resolvedProjectPath {
+                    fallbackParams["cwd"] = .string(resolvedProjectPath)
+                }
                 let response = try await sendRequestWithApprovalPolicyFallback(
                     method: "thread/fork",
-                    baseParams: ["threadId": .string(normalizedSourceThreadId)],
+                    baseParams: fallbackParams,
                     context: "minimal"
                 )
                 let forkedThread = try await handleThreadForkResponse(

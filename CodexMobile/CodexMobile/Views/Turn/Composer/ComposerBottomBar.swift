@@ -329,39 +329,14 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
             && lhs.runtimeState == rhs.runtimeState
     }
 
-    // Renders one consolidated runtime pill backed by a real UIKit UIMenu so we
-    // can use hierarchical Model / Intelligence / Speed rows with subtitles
-    // without hitting SwiftUI nested-Menu glitches.
+    // Separate tap targets keep the menus reachable even when Claude model names
+    // and reasoning labels are long enough to crowd the compact composer.
     var body: some View {
-        UIKitMenuButton {
-            composerMenuLabel(
-                modelPart: modelLabelPart,
-                effortPart: effortLabelPart,
-                leadingImageName: runtimeState.showsSpeedBadgeInModelMenu ? "bolt.fill" : nil
-            )
-        } menu: {
-            TurnComposerRuntimeUIKitMenuBuilder.makeMenu(
-                .init(
-                    runtimeState: runtimeState,
-                    runtimeActions: runtimeActions,
-                    orderedModelOptions: orderedModelOptions,
-                    selectedModelID: selectedModelID,
-                    selectedModelTitle: selectedModelTitle,
-                    isLoadingModels: isLoadingModels,
-                    isRuntimeSelectionLoading: isRuntimeSelectionLoading,
-                    featuredModelIdentifiers: Self.featuredModelIdentifiers,
-                    onRequestAllModelsSheet: {
-                        // Defer to the next runloop so the menu dismissal
-                        // animation isn't fighting the sheet presentation.
-                        DispatchQueue.main.async {
-                            showsAllModelsSheet = true
-                        }
-                    }
-                )
-            )
+        HStack(spacing: 8) {
+            modelSelector
+            reasoningSelector
         }
-        .fixedSize(horizontal: true, vertical: false)
-        .layoutPriority(1)
+        .layoutPriority(-1)
         .tint(metaLabelColor)
     }
 
@@ -375,7 +350,13 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
 
     private var effortLabelPart: String? {
         guard selectedModelID != nil else { return nil }
-        return runtimeState.selectedReasoningTitle
+        let title = runtimeState.selectedReasoningTitle
+        return title == "Select reasoning" ? "Reasoning" : title
+    }
+
+    private var reasoningButtonTitle: String {
+        guard selectedModelID != nil else { return "Reasoning" }
+        return effortLabelPart ?? "Reasoning"
     }
 
     // Keeps the family suffix visible while shortening the common GPT prefix.
@@ -383,6 +364,8 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
         let stripped: String
         if selectedModelTitle.lowercased().hasPrefix("gpt-") {
             stripped = String(selectedModelTitle.dropFirst("GPT-".count))
+        } else if selectedModelTitle.lowercased().hasPrefix("claude ") {
+            stripped = String(selectedModelTitle.dropFirst("Claude ".count))
         } else {
             stripped = selectedModelTitle
         }
@@ -394,24 +377,82 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
     private static let featuredModelIdentifiers: Set<String> = [
         "gpt-5.5",
         "gpt-5.4",
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5-20251001",
     ]
 
-    private func composerMenuLabel(
-        modelPart: String,
-        effortPart: String?,
-        leadingImageName: String?
-    ) -> some View {
-        HStack(spacing: 6) {
-            if let leadingImageName {
-                RemodexIcon.image(systemName: leadingImageName)
-                    .font(metaSymbolFont)
-                    .foregroundStyle(Color.primary)
+    private var menuInput: TurnComposerRuntimeUIKitMenuBuilder.Input {
+        .init(
+            runtimeState: runtimeState,
+            runtimeActions: runtimeActions,
+            orderedModelOptions: orderedModelOptions,
+            selectedModelID: selectedModelID,
+            selectedModelTitle: selectedModelTitle,
+            isLoadingModels: isLoadingModels,
+            isRuntimeSelectionLoading: isRuntimeSelectionLoading,
+            featuredModelIdentifiers: Self.featuredModelIdentifiers,
+            onRequestAllModelsSheet: {
+                // Defer to the next runloop so the menu dismissal animation
+                // isn't fighting the sheet presentation.
+                DispatchQueue.main.async {
+                    showsAllModelsSheet = true
+                }
             }
+        )
+    }
 
-            titleText(modelPart: modelPart, effortPart: effortPart)
+    private var modelSelector: some View {
+        UIKitMenuButton {
+            selectorLabel(
+                title: modelLabelPart,
+                systemName: runtimeState.showsSpeedBadgeInModelMenu ? "bolt.fill" : "cube",
+                width: modelPillWidth,
+                primaryText: true
+            )
+        } menu: {
+            TurnComposerRuntimeUIKitMenuBuilder.makeModelSelectionMenu(menuInput)
+        }
+        .frame(width: modelPillWidth, alignment: .leading)
+        .clipped()
+    }
+
+    private var reasoningSelector: some View {
+        UIKitMenuButton {
+            selectorLabel(
+                title: reasoningButtonTitle,
+                systemName: "brain",
+                width: reasoningPillWidth,
+                primaryText: selectedModelID != nil && effortLabelPart != nil
+            )
+        } menu: {
+            TurnComposerRuntimeUIKitMenuBuilder.makeReasoningSelectionMenu(menuInput)
+        }
+        .frame(width: reasoningPillWidth, alignment: .leading)
+        .clipped()
+    }
+
+    private var modelPillWidth: CGFloat { 92 }
+    private var reasoningPillWidth: CGFloat { 98 }
+
+    private func selectorLabel(
+        title: String,
+        systemName: String,
+        width: CGFloat,
+        primaryText: Bool
+    ) -> some View {
+        HStack(spacing: 5) {
+            RemodexIcon.image(systemName: systemName)
+                .font(metaSymbolFont)
+                .foregroundStyle(primaryText ? Color.primary : metaLabelColor)
+
+            Text(title)
                 .font(metaTextFont)
                 .fontWeight(.regular)
+                .foregroundStyle(primaryText ? Color.primary : metaLabelColor)
                 .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.82)
 
             RemodexIcon.image(systemName: "chevron.down")
                 .font(metaChevronFont)
@@ -419,17 +460,9 @@ private struct ComposerRuntimeMenuControl: View, Equatable {
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 4)
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(width: width, alignment: .leading)
+        .clipped()
         .contentShape(Rectangle())
-    }
-
-    // Concatenated Text lets each segment carry its own foreground style.
-    private func titleText(modelPart: String, effortPart: String?) -> Text {
-        let model = Text(modelPart).foregroundStyle(Color.primary)
-        guard let effortPart, !effortPart.isEmpty else { return model }
-        return model
-            + Text(" ")
-            + Text(effortPart).foregroundStyle(.tertiary)
     }
 }
 

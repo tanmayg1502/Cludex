@@ -47,26 +47,33 @@ function createPushNotificationTracker({
   }
 
   // Keeps the top-level handler focused on orchestration while helpers own terminal edge cases.
-  function routeTerminalMessage({ method, params, eventObject, threadId, turnId }) {
+  function routeTerminalMessage({ method, params, eventObject, threadId, turnId, agentId }) {
+    if (isApprovalRequestMethod(method)) {
+      // Approvals use a distinct result token so they don't dedupe against turn completions on the same turn.
+      void notifyCompletion(threadId, turnId, params, eventObject, { forcedResult: "approval", agentId, isApproval: true });
+      return;
+    }
+
     if (method === "turn/failed" || isFailureEnvelope(method, eventObject)) {
       if (shouldIgnoreRetriableFailure(params, eventObject)) {
         return;
       }
 
       recordFailure(threadId, turnId, params, eventObject);
-      void notifyCompletion(threadId, turnId, params, eventObject, { forcedResult: "failed" });
+      void notifyCompletion(threadId, turnId, params, eventObject, { forcedResult: "failed", agentId });
       return;
     }
 
     if (isTerminalThreadStatusMethod(method)) {
       void notifyCompletion(threadId, turnId, params, eventObject, {
         forcedResult: resolveThreadStatusResult(params, eventObject),
+        agentId,
       });
       return;
     }
 
     if (method === "turn/completed") {
-      void notifyCompletion(threadId, turnId, params, eventObject);
+      void notifyCompletion(threadId, turnId, params, eventObject, { agentId });
     }
   }
 
@@ -99,7 +106,7 @@ function createPushNotificationTracker({
   }
 
   // Buckets turnless completions so repeated terminal events dedupe briefly instead of forever.
-  async function notifyCompletion(threadId, turnId, params, eventObject, { forcedResult = null } = {}) {
+  async function notifyCompletion(threadId, turnId, params, eventObject, { forcedResult = null, agentId = null, isApproval = false } = {}) {
     const resolvedThreadId = threadId || (turnId ? threadIdByTurnId.get(turnId) : null);
     if (!pushServiceClient?.hasConfiguredBaseUrl || !resolvedThreadId) {
       return;
@@ -140,6 +147,8 @@ function createPushNotificationTracker({
       params,
       eventObject,
       previewMaxChars,
+      agentId,
+      isApproval,
     });
 
     try {
@@ -275,6 +284,7 @@ function parseOutboundMessage(rawMessage) {
     eventObject,
     threadId: resolveThreadId(method, params, eventObject),
     turnId: resolveTurnId(method, params, eventObject),
+    agentId: resolveAgentId(params, eventObject),
   };
 }
 
@@ -334,6 +344,26 @@ function resolveTurnId(_method, params, eventObject) {
     eventObject?.turn_id,
     itemObject?.turnId,
     itemObject?.turn_id,
+  ];
+
+  for (const candidate of candidates) {
+    const value = readString(candidate);
+    if (value) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function resolveAgentId(params, eventObject) {
+  const candidates = [
+    params?.agentId,
+    params?.agent_id,
+    params?.turn?.agentId,
+    params?.turn?.agent_id,
+    eventObject?.agentId,
+    eventObject?.agent_id,
   ];
 
   for (const candidate of candidates) {
@@ -589,7 +619,18 @@ function shouldIgnoreRetriableFailure(params, eventObject) {
   return retryCandidates.some((candidate) => parseBooleanFlag(candidate) === true);
 }
 
-function buildNotificationBody({ result, state, params, eventObject, previewMaxChars }) {
+function isApprovalRequestMethod(method) {
+  return typeof method === "string" && method.endsWith("requestApproval");
+}
+
+function agentLabel(agentId) {
+  return agentId === "claude-code" ? "Claude" : "Codex";
+}
+
+function buildNotificationBody({ result, state, params, eventObject, previewMaxChars, agentId, isApproval }) {
+  if (isApproval || result === "approval") {
+    return `${agentLabel(agentId)} needs approval`;
+  }
   if (result === "failed") {
     return truncatePreview(
       state?.latestFailurePreview
@@ -599,7 +640,7 @@ function buildNotificationBody({ result, state, params, eventObject, previewMaxC
     ) || "Run failed";
   }
 
-  return "Response ready";
+  return agentId === "claude-code" ? "Claude finished a turn" : "Response ready";
 }
 
 function truncatePreview(value, limit) {

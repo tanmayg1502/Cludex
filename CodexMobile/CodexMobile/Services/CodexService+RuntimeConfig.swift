@@ -30,6 +30,36 @@ private enum RuntimeSelectionDefaults {
     }
 }
 
+private enum RuntimeClaudeReasoningEfforts {
+    static func options(for identifier: String?) -> [CodexReasoningEffortOption] {
+        let normalized = identifier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard normalized.hasPrefix("claude-") else {
+            return []
+        }
+
+        let base = [
+            CodexReasoningEffortOption(reasoningEffort: "low", description: "Minimal thinking, fastest responses."),
+            CodexReasoningEffortOption(reasoningEffort: "medium", description: "Moderate thinking."),
+            CodexReasoningEffortOption(reasoningEffort: "high", description: "Deep reasoning."),
+        ]
+
+        if normalized.contains("opus") {
+            return base + [
+                CodexReasoningEffortOption(reasoningEffort: "xhigh", description: "Deeper than high."),
+                CodexReasoningEffortOption(reasoningEffort: "max", description: "Maximum effort."),
+            ]
+        }
+
+        if normalized.contains("sonnet") {
+            return base + [
+                CodexReasoningEffortOption(reasoningEffort: "max", description: "Maximum effort."),
+            ]
+        }
+
+        return base
+    }
+}
+
 extension CodexService {
     // Resolves the effective per-chat override record after normalizing the thread id.
     func threadRuntimeOverride(for threadId: String?) -> CodexThreadRuntimeOverride? {
@@ -211,7 +241,11 @@ extension CodexService {
     }
 
     // Composer chrome should not present the canonical fallback as a loaded user choice.
-    func visibleSelectedModelIDForComposer() -> String? {
+    func visibleSelectedModelIDForComposer(threadId: String? = nil) -> String? {
+        if let threadModel = effectiveModelIdentifierForComposer(threadId: threadId) {
+            return modelOption(matching: threadModel)?.id ?? threadModel
+        }
+
         if let selectedModel = selectedModelOption() {
             return selectedModel.id
         }
@@ -247,8 +281,14 @@ extension CodexService {
         selectedGitWriterModelOption()?.model
     }
 
-    func supportedReasoningEffortsForSelectedModel() -> [CodexReasoningEffortOption] {
-        selectedModelOption()?.supportedReasoningEfforts ?? []
+    func supportedReasoningEffortsForSelectedModel(threadId: String? = nil) -> [CodexReasoningEffortOption] {
+        let modelIdentifier = effectiveModelIdentifierForComposer(threadId: threadId)
+        let model = modelOption(matching: modelIdentifier) ?? selectedModelOption()
+        if let efforts = model?.supportedReasoningEfforts,
+           !efforts.isEmpty {
+            return efforts
+        }
+        return RuntimeClaudeReasoningEfforts.options(for: model?.model ?? modelIdentifier ?? selectedModelId)
     }
 
     func isThreadReasoningEffortOverridden(_ threadId: String?) -> Bool {
@@ -269,13 +309,17 @@ extension CodexService {
     }
 
     func selectedReasoningEffortForSelectedModel(threadId: String? = nil) -> String? {
-        guard let model = selectedModelOption() else {
+        let modelIdentifier = effectiveModelIdentifierForComposer(threadId: threadId)
+        guard let model = modelOption(matching: modelIdentifier) ?? selectedModelOption() else {
             return RuntimeSelectionDefaults.reasoningEffort(for: selectedModelId)
                 ?? selectedReasoningEffort
                 ?? RuntimeSelectionDefaults.reasoningEffort
         }
 
-        let supported = Set(model.supportedReasoningEfforts.map { $0.reasoningEffort })
+        let supportedOptions = model.supportedReasoningEfforts.isEmpty
+            ? RuntimeClaudeReasoningEfforts.options(for: model.model)
+            : model.supportedReasoningEfforts
+        let supported = Set(supportedOptions.map { $0.reasoningEffort })
         guard !supported.isEmpty else {
             return nil
         }
@@ -301,11 +345,30 @@ extension CodexService {
             return "medium"
         }
 
-        return model.supportedReasoningEfforts.first?.reasoningEffort
+        return supportedOptions.first?.reasoningEffort
     }
 
     func runtimeModelIdentifierForTurn() -> String? {
         selectedModelOption()?.model ?? selectedModelId ?? RuntimeSelectionDefaults.modelId
+    }
+
+    func modelOption(matching identifier: String?) -> CodexModelOption? {
+        let normalized = identifier?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !normalized.isEmpty else {
+            return nil
+        }
+        return availableModels.first {
+            $0.id == normalized || $0.model == normalized
+        }
+    }
+
+    func effectiveModelIdentifierForComposer(threadId: String?) -> String? {
+        guard let threadId,
+              let threadModel = thread(for: threadId)?.model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !threadModel.isEmpty else {
+            return nil
+        }
+        return threadModel
     }
 
     func effectiveServiceTier(for threadId: String? = nil) -> CodexServiceTier? {

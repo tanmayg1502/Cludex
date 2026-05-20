@@ -72,10 +72,12 @@ struct SettingsConnectionCard: View {
                     HapticFeedback.shared.triggerImpactFeedback()
                     disconnectRelay()
                 }
-            } else if codex.hasTrustedMacReconnectCandidate {
+            }
+
+            if codex.hasSavedConnectionState {
                 SettingsButton("Forget Pair", role: .destructive) {
                     HapticFeedback.shared.triggerImpactFeedback()
-                    codex.forgetTrustedMac()
+                    forgetPair()
                 }
             }
         }
@@ -145,6 +147,15 @@ struct SettingsConnectionCard: View {
         Task { @MainActor in
             await codex.disconnect()
             codex.clearSavedRelaySession()
+        }
+    }
+
+    private func forgetPair() {
+        Task { @MainActor in
+            if codex.isConnected {
+                await codex.disconnect()
+            }
+            codex.forgetReconnectCandidate()
         }
     }
 

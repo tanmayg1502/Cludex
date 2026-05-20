@@ -2,13 +2,15 @@
 // Purpose: Handles explicit desktop handoff, display wake, and bridge preference RPCs for Codex.app.
 // Layer: Bridge handler
 // Exports: handleDesktopRequest
-// Depends on: child_process, fs, os, path, ./rollout-watch
+// Depends on: child_process, fs, os, path, ./rollout-watch, ./claude-code-session-map, ./session-browser-server
 
 const { execFile } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { promisify } = require("util");
 const { findRolloutFileForThread, resolveSessionsRoot } = require("./rollout-watch");
+const { getSessionEntry } = require("./claude-code-session-map");
+const { getSessionBrowserServer } = require("./session-browser-server");
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_BUNDLE_ID = "com.openai.codex";
@@ -72,6 +74,9 @@ async function handleDesktopMethod(method, params, options = {}) {
   const relaunchWaitMs = options.relaunchWaitMs ?? DEFAULT_RELAUNCH_WAIT_MS;
   const threadMaterializeWaitMs = options.threadMaterializeWaitMs ?? DEFAULT_THREAD_MATERIALIZE_WAIT_MS;
   const threadMaterializePollMs = options.threadMaterializePollMs ?? DEFAULT_THREAD_MATERIALIZE_POLL_MS;
+  // Testability hooks: allow overriding Claude-branch session lookup and browser server
+  const sessionEntryGetter = options.getSessionEntry || getSessionEntry;
+  const browserServerGetter = options.getBrowserServer || getSessionBrowserServer;
 
   switch (method) {
     case "desktop/continueOnDesktop":
@@ -95,6 +100,8 @@ async function handleDesktopMethod(method, params, options = {}) {
         relaunchWaitMs,
         threadMaterializeWaitMs,
         threadMaterializePollMs,
+        sessionEntryGetter,
+        browserServerGetter,
       });
     case "desktop/continueOnMac":
       if (platform !== "darwin") {
@@ -117,6 +124,8 @@ async function handleDesktopMethod(method, params, options = {}) {
         relaunchWaitMs,
         threadMaterializeWaitMs,
         threadMaterializePollMs,
+        sessionEntryGetter,
+        browserServerGetter,
       });
     case "desktop/wakeDisplay":
       return wakeDisplay({
@@ -147,6 +156,8 @@ async function continueOnDesktop(
     relaunchWaitMs,
     threadMaterializeWaitMs,
     threadMaterializePollMs,
+    sessionEntryGetter,
+    browserServerGetter,
   }
 ) {
   const threadId = resolveThreadId(params);
@@ -155,6 +166,22 @@ async function continueOnDesktop(
   }
   if (!isValidDesktopThreadId(threadId)) {
     throw desktopError("invalid_thread_id", "The requested desktop thread id is not valid.");
+  }
+
+  // Branch: Claude Code threads open the local session browser instead of Codex.app
+  const sessionEntry = sessionEntryGetter(threadId);
+  const isClaudeThread = sessionEntry?.agentId === "claude-code";
+
+  if (isClaudeThread) {
+    const browserServer = browserServerGetter();
+    await browserServer.start();
+    const url = browserServer.focusUrl(threadId);
+    if (platform === "win32") {
+      await openWindowsDeepLink(url, { executor, env });
+    } else {
+      await executor("open", [url], { timeout: HANDOFF_TIMEOUT_MS });
+    }
+    return { ok: true, target: "session-browser", url };
   }
 
   const targetUrl = `codex://threads/${threadId}`;

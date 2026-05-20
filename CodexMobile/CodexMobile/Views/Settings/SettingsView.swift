@@ -7,6 +7,7 @@ import SwiftUI
 import UIKit
 
 struct SettingsView: View {
+    @Environment(CodexService.self) private var codex
     @AppStorage("codex.appFontStyle") private var appFontStyleRawValue = AppFont.defaultStoredStyleRawValue
 
     var body: some View {
@@ -20,6 +21,9 @@ struct SettingsView: View {
             SettingsSubscriptionCard()
             SettingsBridgeVersionCard()
             SettingsRuntimeDefaultsCard()
+            if let activeThreadId = codex.activeThreadId {
+                ThreadAgentSwitcherCard(threadId: activeThreadId)
+            }
             SettingsAboutCard()
             SettingsUsageCard()
             SettingsConnectionCard()

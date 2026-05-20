@@ -51,6 +51,26 @@ enum TurnComposerRuntimeUIKitMenuBuilder {
         return UIMenu(title: "", options: [.displayInline], children: children)
     }
 
+    static func makeModelSelectionMenu(_ input: Input) -> UIMenu {
+        modelMenu(input)
+    }
+
+    static func makeReasoningSelectionMenu(_ input: Input) -> UIMenu {
+        let options = input.runtimeState.reasoningDisplayOptions
+        guard !options.isEmpty else {
+            return UIMenu(
+                title: "Reasoning",
+                children: [disabledInfoAction(title: "No reasoning options")]
+            )
+        }
+
+        return UIMenu(
+            title: "Reasoning",
+            options: [.singleSelection],
+            children: reasoningActions(input)
+        )
+    }
+
     // MARK: - Model
 
     private static func modelMenu(_ input: Input) -> UIMenu {
@@ -148,7 +168,17 @@ enum TurnComposerRuntimeUIKitMenuBuilder {
         let options = input.runtimeState.reasoningDisplayOptions
         guard !options.isEmpty else { return nil }
 
-        let actions: [UIMenuElement] = options.map { option in
+        return UIMenu(
+            title: "Intelligence",
+            subtitle: input.runtimeState.selectedReasoningTitle,
+            image: RemodexIcon.uiImage(systemName: "brain"),
+            options: [.singleSelection],
+            children: reasoningActions(input)
+        )
+    }
+
+    private static func reasoningActions(_ input: Input) -> [UIMenuElement] {
+        input.runtimeState.reasoningDisplayOptions.map { option in
             let action = UIAction(
                 title: option.title,
                 state: input.runtimeState.isSelectedReasoning(option.effort) ? .on : .off
@@ -161,14 +191,6 @@ enum TurnComposerRuntimeUIKitMenuBuilder {
             }
             return action
         }
-
-        return UIMenu(
-            title: "Intelligence",
-            subtitle: input.runtimeState.selectedReasoningTitle,
-            image: RemodexIcon.uiImage(systemName: "brain"),
-            options: [.singleSelection],
-            children: actions
-        )
     }
 
     // MARK: - Speed

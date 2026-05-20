@@ -180,6 +180,13 @@ extension CodexService {
             assistantPhase: context.identity.phase,
             text: text
         )
+        finalizeClaudeTurnAfterAssistantCompletionIfNeeded(
+            threadId: context.threadId,
+            turnId: turnId,
+            paramsObject: paramsObject,
+            eventObject: eventObject,
+            itemObject: itemObject
+        )
     }
 
     func isCompletedGeneratedImageItemType(_ itemType: String) -> Bool {
@@ -416,6 +423,52 @@ private extension CodexService {
             || itemType == "assistantmessage"
             || itemType == "exitedreviewmode"
             || (itemType == "message" && !normalizedRole.contains("user"))
+    }
+
+    // Claude Code can deliver the final assistant item before (or, after reconnect,
+    // without) the matching turn/completed lifecycle event. Clear the running UI
+    // once that final Claude assistant item is committed, while refusing to touch
+    // a newer active turn if ids no longer match.
+    func finalizeClaudeTurnAfterAssistantCompletionIfNeeded(
+        threadId: String,
+        turnId: String?,
+        paramsObject: IncomingParamsObject,
+        eventObject: IncomingParamsObject?,
+        itemObject: IncomingParamsObject
+    ) {
+        guard isClaudeAgentEvent(
+            paramsObject: paramsObject,
+            eventObject: eventObject,
+            itemObject: itemObject
+        ) else {
+            return
+        }
+
+        let resolvedTurnId = turnId ?? activeTurnIdByThread[threadId]
+        if let activeTurnId = activeTurnIdByThread[threadId],
+           let resolvedTurnId,
+           activeTurnId != resolvedTurnId {
+            return
+        }
+
+        recordTurnTerminalState(threadId: threadId, turnId: resolvedTurnId, state: .completed)
+        noteTurnFinished(turnId: resolvedTurnId)
+        markTurnCompleted(threadId: threadId, turnId: resolvedTurnId)
+    }
+
+    func isClaudeAgentEvent(
+        paramsObject: IncomingParamsObject,
+        eventObject: IncomingParamsObject?,
+        itemObject: IncomingParamsObject?
+    ) -> Bool {
+        firstNonEmptyString([
+            paramsObject["agentId"]?.stringValue,
+            paramsObject["agent_id"]?.stringValue,
+            eventObject?["agentId"]?.stringValue,
+            eventObject?["agent_id"]?.stringValue,
+            itemObject?["agentId"]?.stringValue,
+            itemObject?["agent_id"]?.stringValue,
+        ]) == CodexClaudeDefaults.agentId
     }
 
     // Review mode exits deliver the final review text under `review` instead of message content.

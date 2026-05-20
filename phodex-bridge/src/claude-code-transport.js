@@ -120,6 +120,8 @@ function createClaudeCodeTransport({
         return handleThreadRead(id, params);
       case "thread/update":
         return handleThreadUpdate(id, params);
+      case "thread/fork":
+        return handleThreadFork(id, params);
       case "approval/response":
         return handleApprovalResponse(params);
       case "thread/rename":
@@ -136,9 +138,24 @@ function createClaudeCodeTransport({
     const cwd = normalizeString(params.cwd) || process.cwd();
     const model = resolveClaudeModel(params.model);
     const permissionMode = normalizeString(params.permissionMode) || defaultPermissionMode;
+    const parentThreadId = normalizeString(params.parentThreadId || params.parent_thread_id);
+    const agentRole = normalizeString(params.agentRole || params.agent_role || params.role);
+    const title = normalizeString(params.title || params.name);
     const firstMessage = normalizeString(params.content || params.message || params.prompt)
       || extractTextFromInputItems(params.input)
       || "";
+    const entry = {
+      sessionId: null,
+      cwd,
+      agentId: "claude-code",
+      model,
+      permissionMode,
+      parentThreadId,
+      agentRole,
+      createdAt: new Date().toISOString(),
+      title: title || null,
+    };
+    sessionStore.saveSessionEntry(threadId, entry);
 
     // Pre-warm the subprocess for faster first turn.
     warmSubprocess(threadId, cwd, model, permissionMode);
@@ -148,17 +165,6 @@ function createClaudeCodeTransport({
     }
 
     // No first message: just emit thread/started so the phone knows the thread exists.
-    const entry = {
-      sessionId: null,
-      cwd,
-      agentId: "claude-code",
-      model,
-      permissionMode,
-      createdAt: new Date().toISOString(),
-      title: null,
-    };
-    sessionStore.saveSessionEntry(threadId, entry);
-
     emit(JSON.stringify({
       method: "thread/started",
       params: buildThreadStartedParams(threadId, entry),
@@ -191,20 +197,27 @@ function createClaudeCodeTransport({
     const entry = sessionStore.getSessionEntry(threadId);
     const cwd = normalizeString(entry?.cwd || params.cwd) || process.cwd();
     const model = resolveClaudeModel(params.model || entry?.model);
+    const effort = resolveClaudeEffort(
+      params.effort
+      || params.reasoningEffort
+      || params.reasoning_effort
+    );
     const permissionMode = normalizeString(params.permissionMode || entry?.permissionMode) || defaultPermissionMode;
 
     if (requestId != null) {
       emit(JSON.stringify({ id: requestId, result: { ok: true } }));
     }
 
-    return runTurn(threadId, content, { cwd, model, permissionMode, isFirstTurn: false });
+    return runTurn(threadId, content, { cwd, model, effort, permissionMode, isFirstTurn: false });
   }
 
   // ─── Core turn runner ─────────────────────────────────────────────────────────
 
-  async function runTurn(threadId, prompt, { cwd, model, permissionMode, isFirstTurn }) {
+  async function runTurn(threadId, prompt, { cwd, model, effort, permissionMode, isFirstTurn }) {
     const entry = sessionStore.getSessionEntry(threadId);
     const sessionId = entry?.sessionId || null;
+    const parentThreadId = normalizeString(entry?.parentThreadId);
+    const agentRole = normalizeString(entry?.agentRole);
     const turnId = randomUUID();
 
     const session = activeSessions.get(threadId) || {};
@@ -219,6 +232,10 @@ function createClaudeCodeTransport({
       canUseTool: (toolName, input, { signal }) =>
         handlePermissionRequest(threadId, toolName, input, signal),
     };
+    if (effort) {
+      queryOptions.thinking = { type: "adaptive" };
+      queryOptions.effort = effort;
+    }
 
     if (sessionId) {
       queryOptions.resume = sessionId;
@@ -229,6 +246,12 @@ function createClaudeCodeTransport({
     let assistantItemId = null;
     let assistantText = "";
     let didCompleteAssistantItem = false;
+    // Reasoning / thinking-block state for this turn.
+    let reasoningItemId = null;
+    let reasoningText = "";
+    let reasoningSawStreamDelta = false;
+    // Tool-use state: maps tool_use.id → { itemId, isFileChange }
+    const toolUseIdToItemId = new Map();
 
     const ensureTurnStarted = () => {
       if (!turnStarted) {
@@ -285,6 +308,188 @@ function createClaudeCodeTransport({
       }));
     };
 
+    // ── Reasoning helpers (thinking-blocks) ───────────────────────────────────
+    const ensureReasoningItemId = () => {
+      if (!reasoningItemId) {
+        reasoningItemId = `claude-reasoning-${turnId}`;
+      }
+      return reasoningItemId;
+    };
+    const emitReasoningDelta = (delta) => {
+      if (!delta) return;
+      ensureTurnStarted();
+      const itemId = ensureReasoningItemId();
+      reasoningText += delta;
+      emit(JSON.stringify({
+        // iOS dispatches on item/reasoning/textDelta (see CodexService+Incoming.swift line 218-221)
+        method: "item/reasoning/textDelta",
+        params: {
+          threadId,
+          turnId,
+          itemId,
+          agentId: "claude-code",
+          delta,
+        },
+      }));
+    };
+    const emitReasoningFinalText = (text) => {
+      const finalText = normalizeString(text);
+      if (!finalText) return;
+      if (!reasoningSawStreamDelta) {
+        emitReasoningDelta(finalText);
+        return;
+      }
+      if (finalText.startsWith(reasoningText)) {
+        emitReasoningDelta(finalText.slice(reasoningText.length));
+      }
+    };
+    const emitReasoningCompleted = () => {
+      if (!reasoningText || !reasoningItemId) return;
+      const itemId = reasoningItemId;
+      const fullText = reasoningText;
+      // iOS decodeReasoningItemBody reads itemObject["content"] (see line 2279)
+      emit(JSON.stringify({
+        method: "item/completed",
+        params: {
+          threadId,
+          turnId,
+          itemId,
+          agentId: "claude-code",
+          item: {
+            id: itemId,
+            type: "reasoning",
+            role: "assistant",
+            content: fullText,
+          },
+        },
+      }));
+      reasoningItemId = null;
+      reasoningText = "";
+    };
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Tool-use helpers (T5: stream-events-parity) ───────────────────────────
+    const emitToolUseStarted = (block) => {
+      ensureTurnStarted();
+      const itemId = randomUUID();
+      const { id: toolUseId, name, input = {} } = block;
+      const isFileChange = name === "Edit" || name === "Write";
+      const filePath = normalizeString(input.file_path || input.path) || "";
+      const changeType = name === "Write" ? "create" : "modify";
+      const changes = isFileChange
+        ? [{ path: filePath, kind: changeType, diff: extractInlineDiff(input) }]
+        : [];
+      toolUseIdToItemId.set(toolUseId, { itemId, isFileChange, changes });
+
+      if (isFileChange) {
+        // iOS reads item.type === "fileChange" via appendCompletedAgentText → handleStructuredItemLifecycle.
+        emit(JSON.stringify({
+          method: "item/started",
+          params: {
+            threadId,
+            turnId,
+            itemId,
+            agentId: "claude-code",
+            item: {
+              id: itemId,
+              type: "fileChange",
+              status: "inProgress",
+              changes,
+            },
+          },
+        }));
+      } else {
+        // Bash / Read / Glob / Grep / generic fallback.
+        let command;
+        if (name === "Bash") {
+          command = input.command || name;
+        } else if (name === "Read" || name === "Glob" || name === "Grep") {
+          command = `${name} ${input.file_path || input.pattern || ""}`.trim();
+        } else {
+          command = `${name} <args>`;
+        }
+        // iOS reads item.type === "commandExecution" and item.command field.
+        emit(JSON.stringify({
+          method: "item/started",
+          params: {
+            threadId,
+            turnId,
+            itemId,
+            agentId: "claude-code",
+            item: {
+              id: itemId,
+              type: "commandExecution",
+              command,
+              status: "running",
+            },
+          },
+        }));
+      }
+    };
+
+    const emitToolResultCompleted = (block) => {
+      const { tool_use_id: toolUseId, content, is_error } = block;
+      const cached = toolUseIdToItemId.get(toolUseId);
+      if (!cached) {
+        console.warn(`${logPrefix} tool_result for unknown tool_use_id=${toolUseId} — skipping`);
+        return;
+      }
+      const { itemId, isFileChange, changes = [] } = cached;
+      toolUseIdToItemId.delete(toolUseId);
+      const output = extractToolResultText(content);
+      const success = !is_error;
+
+      if (isFileChange) {
+        if (output) {
+          emit(JSON.stringify({
+            method: "item/fileChange/outputDelta",
+            params: { threadId, turnId, itemId, agentId: "claude-code", delta: output, output },
+          }));
+        }
+        emit(JSON.stringify({
+          method: "item/completed",
+          params: {
+            threadId,
+            turnId,
+            itemId,
+            agentId: "claude-code",
+            item: {
+              id: itemId,
+              type: "fileChange",
+              status: success ? "completed" : "failed",
+              changes: mergeToolResultIntoChanges(changes, output),
+              output,
+            },
+          },
+        }));
+      } else {
+        if (output) {
+          emit(JSON.stringify({
+            method: "item/commandExecution/outputDelta",
+            params: { threadId, turnId, itemId, agentId: "claude-code", output },
+          }));
+        }
+        emit(JSON.stringify({
+          method: "item/completed",
+          params: {
+            threadId,
+            turnId,
+            itemId,
+            agentId: "claude-code",
+            item: {
+              id: itemId,
+              type: "commandExecution",
+              status: success ? "completed" : "failed",
+              // iOS reads "command" from commandExecutionDetailsByItemID (already set in started).
+              // "output" is consumed by commandExecutionOutputChunk which reads paramsObject["output"].
+              output,
+            },
+          },
+        }));
+      }
+    };
+    // ─────────────────────────────────────────────────────────────────────────
+
     const q = queryImpl({ prompt, options: queryOptions });
     session.activeQuery = q;
     activeSessions.set(threadId, session);
@@ -299,6 +504,8 @@ function createClaudeCodeTransport({
             agentId: "claude-code",
             model,
             permissionMode,
+            parentThreadId,
+            agentRole,
             createdAt: entry?.createdAt || new Date().toISOString(),
             title: entry?.title || null,
           };
@@ -314,14 +521,46 @@ function createClaudeCodeTransport({
         }
 
         if (message.type === "assistant") {
+          const blocks = message.message?.content;
+          if (Array.isArray(blocks)) {
+            for (const block of blocks) {
+              if (block.type === "thinking" && block.thinking) {
+                emitReasoningFinalText(block.thinking);
+              } else if (block.type === "tool_use") {
+                emitToolUseStarted(block);
+              }
+            }
+          }
+          // Flush reasoning before emitting the assistant text item.
+          emitReasoningCompleted();
           const text = extractMessageText(message.message);
           emitAssistantCompleted(text, message.message?.id, message.uuid);
+          continue;
+        }
+
+        // SDK feedback loop: tool results arrive as user messages.
+        if (message.type === "user") {
+          const blocks = message.message?.content;
+          if (Array.isArray(blocks)) {
+            for (const block of blocks) {
+              if (block.type === "tool_result") {
+                emitToolResultCompleted(block);
+              }
+            }
+          }
           continue;
         }
 
         if (message.type === "stream_event") {
           if (message.event?.type === "message_start") {
             ensureAssistantItemId(message.event?.message?.id, message.uuid);
+            continue;
+          }
+          // Handle incremental thinking deltas from the stream.
+          const thinkingDelta = extractStreamEventThinkingDelta(message);
+          if (thinkingDelta) {
+            reasoningSawStreamDelta = true;
+            emitReasoningDelta(thinkingDelta);
             continue;
           }
           const delta = extractStreamEventTextDelta(message);
@@ -332,6 +571,8 @@ function createClaudeCodeTransport({
         }
 
         if (message.type === "result") {
+          // Flush any uncompleted reasoning before turn/completed.
+          emitReasoningCompleted();
           if (!didCompleteAssistantItem) {
             emitAssistantCompleted(message.result || assistantText);
           }
@@ -435,6 +676,12 @@ function createClaudeCodeTransport({
         model: entry.model,
         modelProvider: "claude",
         model_provider: "claude",
+        parentThreadId: entry.parentThreadId || null,
+        parent_thread_id: entry.parentThreadId || null,
+        forkedFromThreadId: entry.forkedFromThreadId || null,
+        forked_from_thread_id: entry.forkedFromThreadId || null,
+        agentRole: entry.agentRole || null,
+        agent_role: entry.agentRole || null,
       });
     }
 
@@ -496,6 +743,12 @@ function createClaudeCodeTransport({
         agentId: "claude-code",
         model: entry.model,
         modelProvider: "claude",
+        parentThreadId: entry.parentThreadId || null,
+        parent_thread_id: entry.parentThreadId || null,
+        forkedFromThreadId: entry.forkedFromThreadId || null,
+        forked_from_thread_id: entry.forkedFromThreadId || null,
+        agentRole: entry.agentRole || null,
+        agent_role: entry.agentRole || null,
         createdAt: entry.createdAt,
         updatedAt: info?.lastModified ? new Date(info.lastModified).toISOString() : entry.updatedAt,
       };
@@ -524,12 +777,67 @@ function createClaudeCodeTransport({
       agentId: normalizeString(params.agentId) || entry.agentId || "claude-code",
       model: normalizeString(params.model) || entry.model || DEFAULT_MODEL,
       permissionMode: normalizeString(params.permissionMode) || entry.permissionMode || defaultPermissionMode,
+      parentThreadId: normalizeString(params.parentThreadId || params.parent_thread_id) || entry.parentThreadId || null,
+      agentRole: normalizeString(params.agentRole || params.agent_role || params.role) || entry.agentRole || null,
       title: params.title !== undefined ? normalizeString(params.title) : entry.title,
     };
     sessionStore.saveSessionEntry(threadId, updated);
 
     if (requestId != null) {
       emit(JSON.stringify({ id: requestId, result: { ok: true } }));
+    }
+  }
+
+  // ─── thread/fork ─────────────────────────────────────────────────────────────
+
+  async function handleThreadFork(requestId, params) {
+    const sourceThreadId = normalizeString(params.threadId || params.thread_id || params.sourceThreadId || params.source_thread_id);
+    if (!sourceThreadId) {
+      if (requestId != null) {
+        emit(JSON.stringify({
+          id: requestId,
+          error: { code: -32602, message: "thread/fork requires threadId." },
+        }));
+      }
+      return;
+    }
+
+    const sourceEntry = sessionStore.getSessionEntry(sourceThreadId);
+    if (!sourceEntry) {
+      if (requestId != null) {
+        emit(JSON.stringify({
+          id: requestId,
+          error: { code: -32004, message: "Claude thread not found." },
+        }));
+      }
+      return;
+    }
+
+    const forkedThreadId = normalizeString(params.newThreadId || params.new_thread_id) || randomUUID();
+    const now = new Date().toISOString();
+    const cwd = normalizeString(params.cwd || params.targetCwd || params.target_cwd) || sourceEntry.cwd || process.cwd();
+    const forkedEntry = {
+      ...sourceEntry,
+      sessionId: null,
+      cwd,
+      createdAt: now,
+      updatedAt: now,
+      title: normalizeString(params.title || params.name) || sourceEntry.title || null,
+      forkedFromThreadId: sourceThreadId,
+    };
+    sessionStore.saveSessionEntry(forkedThreadId, forkedEntry);
+
+    const thread = buildThreadObject(forkedThreadId, forkedEntry);
+    emit(JSON.stringify({
+      method: "thread/started",
+      params: buildThreadStartedParams(forkedThreadId, forkedEntry),
+    }));
+
+    if (requestId != null) {
+      emit(JSON.stringify({
+        id: requestId,
+        result: { thread, cwd },
+      }));
     }
   }
 
@@ -601,7 +909,7 @@ function createClaudeCodeTransport({
         pendingPermissions.delete(permissionId);
         resolve({ behavior: "deny", message: "Auto-denied: no response within timeout." });
         emit(JSON.stringify({
-          method: "approval/timeout",
+        method: "approval/timeout",
           params: { permissionId, threadId, toolName, timeoutSecs: permissionTimeoutMs / 1000 },
         }));
       }, permissionTimeoutMs);
@@ -616,6 +924,8 @@ function createClaudeCodeTransport({
           permissionId,
           threadId,
           thread_id: threadId,
+          turnId: permissionId,
+          turn_id: permissionId,
           command: sanitizeToolInput(toolName, input) || toolName,
           tool: toolName,
           agentId: "claude-code",
@@ -689,6 +999,12 @@ function createClaudeCodeTransport({
       modelProvider: "claude",
       model_provider: "claude",
       cwd: entry.cwd,
+      parentThreadId: entry.parentThreadId || null,
+      parent_thread_id: entry.parentThreadId || null,
+      forkedFromThreadId: entry.forkedFromThreadId || null,
+      forked_from_thread_id: entry.forkedFromThreadId || null,
+      agentRole: entry.agentRole || null,
+      agent_role: entry.agentRole || null,
       createdAt: entry.createdAt,
       updatedAt: entry.updatedAt || entry.createdAt,
     };
@@ -709,6 +1025,15 @@ function createClaudeCodeTransport({
     if (!event) return null;
     if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
       return event.delta.text;
+    }
+    return null;
+  }
+
+  function extractStreamEventThinkingDelta(message) {
+    const event = message.event;
+    if (!event) return null;
+    if (event.type === "content_block_delta" && event.delta?.type === "thinking_delta") {
+      return event.delta.thinking ?? null;
     }
     return null;
   }
@@ -748,6 +1073,51 @@ function createClaudeCodeTransport({
     return null;
   }
 
+  function extractInlineDiff(input) {
+    if (!input || typeof input !== "object") return "";
+    for (const key of ["diff", "patch", "unified_diff"]) {
+      if (typeof input[key] === "string" && input[key].trim()) {
+        return input[key];
+      }
+    }
+    return "";
+  }
+
+  function mergeToolResultIntoChanges(changes, output) {
+    const baseChanges = Array.isArray(changes) && changes.length > 0
+      ? changes
+      : [{ path: "", kind: "modify", diff: "" }];
+    if (!output || !looksLikeUnifiedDiff(output)) {
+      return baseChanges;
+    }
+    return baseChanges.map((change, index) => ({
+      ...change,
+      diff: change.diff || (index === 0 ? output : ""),
+    }));
+  }
+
+  function looksLikeUnifiedDiff(value) {
+    return typeof value === "string"
+      && (value.includes("\n@@ ") || value.startsWith("diff --git ") || value.startsWith("--- "));
+  }
+
+  // Converts a tool_result content value to a plain string for iOS display.
+  // content can be a string, an array of content blocks, or null/undefined.
+  function extractToolResultText(content) {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((block) => {
+          if (typeof block === "string") return block;
+          if (block?.type === "text" && typeof block.text === "string") return block.text;
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n");
+    }
+    return "";
+  }
+
   function sanitizeToolInput(toolName, input) {
     // Surface just enough for the approval UI without leaking potentially sensitive data.
     if (!input || typeof input !== "object") return null;
@@ -766,6 +1136,11 @@ function createClaudeCodeTransport({
 function resolveClaudeModel(value) {
   const s = typeof value === "string" ? value.trim() : "";
   return s.startsWith("claude-") ? s : DEFAULT_MODEL;
+}
+
+function resolveClaudeEffort(value) {
+  const s = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return ["low", "medium", "high", "xhigh", "max"].includes(s) ? s : null;
 }
 
 function clampPermissionTimeout(value) {

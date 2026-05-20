@@ -413,6 +413,47 @@ extension CodexService {
         return thread(for: normalizedThreadId) ?? currentThread
     }
 
+    // Updates both agentId and model on an existing thread in a single thread/update call.
+    func updateThreadAgentAndModel(threadId: String, agentId: String, model: String) async throws {
+        let normalizedThreadId = threadId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedAgentId = agentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedThreadId.isEmpty else {
+            throw CodexServiceError.invalidInput("Thread id is required.")
+        }
+        guard normalizedAgentId == "codex" || normalizedAgentId == "claude-code" else {
+            throw CodexServiceError.invalidInput("Unsupported agent.")
+        }
+        guard var currentThread = thread(for: normalizedThreadId) else {
+            throw CodexServiceError.invalidInput("Thread not found.")
+        }
+
+        var params: [String: JSONValue] = [
+            "threadId": .string(normalizedThreadId),
+            "agentId": .string(normalizedAgentId),
+        ]
+        if !normalizedModel.isEmpty {
+            params["model"] = .string(normalizedModel)
+        }
+
+        let response = try await sendRequest(
+            method: "thread/update",
+            params: .object(params)
+        )
+
+        if let updatedThread = decodeThreadUpdateResponse(from: response.result) {
+            var resolvedThread = updatedThread
+            resolvedThread.agentId = normalizedAgentId
+            if !normalizedModel.isEmpty { resolvedThread.model = normalizedModel }
+            upsertThread(resolvedThread, treatAsServerState: true)
+        } else {
+            currentThread.agentId = normalizedAgentId
+            if !normalizedModel.isEmpty { currentThread.model = normalizedModel }
+            currentThread.updatedAt = Date()
+            upsertThread(currentThread)
+        }
+    }
+
     // Sends user input as a new turn against an existing (or newly created) thread.
     func startTurn(
         userInput: String,
@@ -2156,7 +2197,7 @@ extension CodexService {
         }
         // Keep the legacy top-level fields populated so plan-mode turns still honor
         // the user's selected model on runtimes that do not read collaboration settings.
-        if let modelIdentifier = runtimeModelIdentifierForTurn() {
+        if let modelIdentifier = effectiveModelIdentifierForTurn(threadId: threadId) {
             params["model"] = .string(modelIdentifier)
         }
         if let effort = selectedReasoningEffortForSelectedModel(threadId: threadId) {
@@ -2175,6 +2216,14 @@ extension CodexService {
         return params
     }
 
+    func effectiveModelIdentifierForTurn(threadId: String) -> String? {
+        if let threadModel = thread(for: threadId)?.model?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !threadModel.isEmpty {
+            return threadModel
+        }
+        return runtimeModelIdentifierForTurn()
+    }
+
     // Encodes collaborationMode while allowing the selected mode to supply built-in instructions.
     func buildCollaborationModePayload(
         for mode: CodexCollaborationModeKind?,
@@ -2184,7 +2233,8 @@ extension CodexService {
             return nil
         }
 
-        let resolvedModel = runtimeModelIdentifierForTurn()
+        let resolvedModel = threadId.flatMap { effectiveModelIdentifierForTurn(threadId: $0) }
+            ?? runtimeModelIdentifierForTurn()
             ?? selectedModelOption()?.model
             ?? availableModels.first?.model
             ?? selectedModelId

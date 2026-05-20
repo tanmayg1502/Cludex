@@ -93,6 +93,120 @@ describe("agent-router routing", () => {
     assert.ok(router.describe().includes("claude-agent-sdk"));
     router.shutdown();
   });
+
+  it("model/list merges Claude reasoning effort metadata", async () => {
+    const { createAgentRouter } = require("../src/agent-router");
+    const codexTransport = createStubTransport((parsed, emit) => {
+      if (parsed.method !== "model/list") return;
+      setImmediate(() => {
+        emit({
+          id: parsed.id,
+          result: {
+            items: [
+              {
+                id: "gpt-5.5",
+                model: "gpt-5.5",
+                displayName: "GPT-5.5",
+                supportedReasoningEfforts: [],
+              },
+            ],
+          },
+        });
+      });
+    });
+    const claudeTransport = createStubTransport(() => {});
+    const router = createAgentRouter({
+      config: { claudeCodeEnabled: true },
+      codexTransport,
+      claudeTransport,
+    });
+
+    const response = await new Promise((resolve) => {
+      router.onMessage((raw) => resolve(JSON.parse(raw)));
+      router.send(JSON.stringify({ id: "models-1", method: "model/list", params: {} }));
+    });
+
+    const sonnet = response.result.items.find((model) => model.id === "claude-sonnet-4-6");
+    assert.ok(sonnet, "Claude Sonnet should be merged into model/list");
+    assert.deepEqual(
+      sonnet.supportedReasoningEfforts.map((option) => option.reasoningEffort),
+      ["low", "medium", "high", "max"]
+    );
+    assert.equal(sonnet.defaultReasoningEffort, "high");
+    router.shutdown();
+  });
+
+  it("runDirectTurn captures item/agentMessage streams when turn/completed has no result", async () => {
+    const { createAgentRouter } = require("../src/agent-router");
+    const sentMessages = [];
+    const transport = createStubTransport((parsed, emit) => {
+      sentMessages.push(parsed);
+      if (parsed.method === "thread/start") {
+        setImmediate(() => {
+          emit({
+            id: parsed.id,
+            result: {
+              thread: {
+                id: "codex-assigned-thread",
+                threadId: "codex-assigned-thread",
+              },
+            },
+          });
+        });
+        return;
+      }
+      if (parsed.method !== "turn/start") return;
+      setImmediate(() => {
+        emit({
+          method: "item/agentMessage/delta",
+          params: {
+            threadId: parsed.params.threadId,
+            turnId: parsed.id,
+            delta: "hello ",
+          },
+        });
+        emit({
+          method: "item/completed",
+          params: {
+            threadId: parsed.params.threadId,
+            turnId: parsed.id,
+            item: { type: "agent_message", text: "hello world" },
+          },
+        });
+        emit({
+          method: "turn/completed",
+          params: {
+            threadId: parsed.params.threadId,
+            turnId: parsed.id,
+          },
+        });
+      });
+    });
+
+    const router = createAgentRouter({
+      config: { claudeCodeEnabled: false },
+      codexTransport: transport,
+    });
+
+    const result = await router.runDirectTurn({
+      agentId: "codex",
+      threadId: "thread-direct",
+      prompt: "Say hello",
+      cwd: "/tmp",
+      model: "gpt-5",
+      parentThreadId: "parent-1",
+      role: "implementer",
+    });
+    assert.equal(result.result, "hello world");
+    assert.equal(result.threadId, "codex-assigned-thread");
+    const threadStart = sentMessages.find((message) => message.method === "thread/start");
+    assert.equal(threadStart.params.threadId, undefined);
+    const turnStart = sentMessages.find((message) => message.method === "turn/start");
+    assert.equal(turnStart.params.threadId, "codex-assigned-thread");
+    assert.deepEqual(turnStart.params.input, [{ type: "text", text: "Say hello" }]);
+    assert.equal(turnStart.params.prompt, undefined);
+    router.shutdown();
+  });
 });
 
 // ─── claude-code-transport unit tests ────────────────────────────────────────
@@ -253,6 +367,73 @@ describe("claude-code-transport", () => {
     assert.equal(completedItem.params.item.role, "assistant");
     assert.equal(completedItem.params.item.text, "Hello there");
   });
+
+  it("passes selected effort through to Claude SDK queries", async () => {
+    const { createClaudeCodeTransport } = require("../src/claude-code-transport");
+    let capturedOptions = null;
+    const transport = createClaudeCodeTransport({
+      config: {},
+      queryImpl: async function* ({ options }) {
+        capturedOptions = options;
+        yield { type: "system", subtype: "init", session_id: "claude-session-effort" };
+        yield { type: "result", subtype: "success", result: "done" };
+      },
+    });
+
+    transport.send(JSON.stringify({
+      id: "turn-effort",
+      method: "turn/start",
+      params: {
+        threadId: "thread-effort",
+        prompt: "think",
+        model: "claude-sonnet-4-6",
+        effort: "max",
+      },
+    }));
+
+    await waitFor(() => capturedOptions !== null);
+    assert.equal(capturedOptions.effort, "max");
+    assert.deepEqual(capturedOptions.thinking, { type: "adaptive" });
+    transport.shutdown();
+  });
+
+  it("forks Claude threads into a new session-map entry", async () => {
+    const { createClaudeCodeTransport } = require("../src/claude-code-transport");
+    const sessionStore = createMemorySessionStore();
+    sessionStore.saveSessionEntry("source-thread", {
+      sessionId: "claude-session-1",
+      cwd: "/tmp/source",
+      agentId: "claude-code",
+      model: "claude-sonnet-4-6",
+      permissionMode: "acceptEdits",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      title: "Source",
+    });
+
+    const transport = createClaudeCodeTransport({ config: {}, sessionStore });
+    const messages = [];
+    transport.onMessage((raw) => messages.push(JSON.parse(raw)));
+    transport.send(JSON.stringify({
+      id: "fork-1",
+      method: "thread/fork",
+      params: {
+        threadId: "source-thread",
+        newThreadId: "forked-thread",
+        cwd: "/tmp/worktree",
+      },
+    }));
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const response = messages.find((message) => message.id === "fork-1");
+    assert.equal(response.result.thread.id, "forked-thread");
+    assert.equal(response.result.thread.forkedFromThreadId, "source-thread");
+    assert.equal(response.result.thread.cwd, "/tmp/worktree");
+    const entry = sessionStore.getSessionEntry("forked-thread");
+    assert.equal(entry.sessionId, null);
+    assert.equal(entry.forkedFromThreadId, "source-thread");
+    assert.equal(entry.cwd, "/tmp/worktree");
+    transport.shutdown();
+  });
 });
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -300,6 +481,32 @@ function requireWithTmpDir(tmpDir) {
   }
 
   return { loadSessionMap, saveSessionEntry, deleteSessionEntry, getSessionEntry, listSessionEntries };
+}
+
+function createStubTransport(onSend) {
+  let onMessageHandler = () => {};
+  return {
+    send(raw) {
+      const parsed = JSON.parse(raw);
+      onSend(parsed, (message) => onMessageHandler(JSON.stringify(message)));
+    },
+    onMessage(handler) { onMessageHandler = handler; },
+    onClose() {},
+    onError() {},
+    onStarted() {},
+    shutdown() {},
+    describe() { return "stub"; },
+  };
+}
+
+async function waitFor(predicate, timeoutMs = 1000) {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 function createMemorySessionStore() {
