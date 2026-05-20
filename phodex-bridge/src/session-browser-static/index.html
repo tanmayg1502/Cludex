@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Remodex Sessions</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Remodex Sessions</h1>
+</header>
+<main>
+  <div class="tabs">
+    <button class="tab active" data-tab="claude">Claude</button>
+    <button class="tab" data-tab="codex">Codex</button>
+  </div>
+  <div class="panels">
+    <div id="panel-claude" class="panel active">
+      <div class="session-list" id="list-claude"><p class="loading">Loading…</p></div>
+    </div>
+    <div id="panel-codex" class="panel">
+      <div class="session-list" id="list-codex"><p class="loading">Loading…</p></div>
+    </div>
+  </div>
+</main>
+<script>
+(function () {
+  "use strict";
+
+  const params = new URLSearchParams(location.search);
+  const focusId = params.get("focus") || "";
+
+  // Tab switching
+  document.querySelectorAll(".tab").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll(".tab").forEach(function (b) { b.classList.remove("active"); });
+      document.querySelectorAll(".panel").forEach(function (p) { p.classList.remove("active"); });
+      btn.classList.add("active");
+      document.getElementById("panel-" + btn.dataset.tab).classList.add("active");
+    });
+  });
+
+  function formatDate(iso) {
+    if (!iso) return "—";
+    try {
+      return new Date(iso).toLocaleString();
+    } catch (_) {
+      return iso;
+    }
+  }
+
+  function openTerminal(session, button) {
+    button.disabled = true;
+    fetch("/api/open-terminal?id=" + encodeURIComponent(session.id || "") + "&agent=" + encodeURIComponent(session.agentId || ""))
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (!result.ok) throw new Error(result.error || "Open failed");
+        button.textContent = "Opened";
+      })
+      .catch(function () {
+        button.textContent = "Failed";
+      })
+      .finally(function () {
+        setTimeout(function () {
+          button.disabled = false;
+          button.textContent = "Terminal";
+        }, 1500);
+      });
+  }
+
+  function buildRow(session, isFocused) {
+    var row = document.createElement("div");
+    row.className = "session-row" + (isFocused ? " focused" : "");
+    row.dataset.id = session.id || "";
+
+    var header = document.createElement("div");
+    header.className = "session-header";
+
+    var title = document.createElement("div");
+    title.className = "session-title";
+    title.textContent = session.title || session.id || "(untitled)";
+    header.appendChild(title);
+
+    if (session.cwd) {
+      var button = document.createElement("button");
+      button.className = "session-action";
+      button.type = "button";
+      button.textContent = "Terminal";
+      button.addEventListener("click", function () { openTerminal(session, button); });
+      header.appendChild(button);
+    }
+
+    var meta = document.createElement("div");
+    meta.className = "session-meta";
+
+    var parts = [];
+    if (session.model) parts.push("Model: " + session.model);
+    if (session.agentId) parts.push("Agent: " + session.agentId);
+    if (session.updatedAt) parts.push("Updated: " + formatDate(session.updatedAt));
+    if (session.cwd) parts.push("Dir: " + session.cwd);
+    meta.textContent = parts.join(" · ");
+
+    if (session.cwd) {
+      var hint = document.createElement("div");
+      hint.className = "session-hint";
+      hint.textContent = "cd " + session.cwd;
+      row.appendChild(header);
+      row.appendChild(meta);
+      row.appendChild(hint);
+    } else {
+      row.appendChild(header);
+      row.appendChild(meta);
+    }
+
+    return row;
+  }
+
+  function renderList(containerId, sessions) {
+    var container = document.getElementById(containerId);
+    container.innerHTML = "";
+    if (!sessions || sessions.length === 0) {
+      var empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No sessions found.";
+      container.appendChild(empty);
+      return;
+    }
+
+    var focusedRow = null;
+    sessions.forEach(function (session) {
+      var isFocused = focusId && session.id === focusId;
+      var row = buildRow(session, isFocused);
+      container.appendChild(row);
+      if (isFocused) focusedRow = row;
+    });
+
+    if (focusedRow) {
+      setTimeout(function () { focusedRow.scrollIntoView({ block: "center", behavior: "smooth" }); }, 100);
+    }
+  }
+
+  fetch("/api/sessions")
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      renderList("list-claude", data.claude || []);
+      renderList("list-codex", data.codex || []);
+
+      // If the focused thread is a Claude thread, make sure the Claude tab is active
+      var allSessions = (data.claude || []).concat(data.codex || []);
+      if (focusId) {
+        var claudeIds = (data.claude || []).map(function (s) { return s.id; });
+        if (claudeIds.indexOf(focusId) !== -1) {
+          document.querySelector("[data-tab='claude']").click();
+        } else {
+          document.querySelector("[data-tab='codex']").click();
+        }
+      }
+    })
+    .catch(function (err) {
+      document.getElementById("list-claude").innerHTML = "<p class='error'>Failed to load sessions.</p>";
+      document.getElementById("list-codex").innerHTML = "<p class='error'>Failed to load sessions.</p>";
+    });
+}());
+</script>
+</body>
+</html>

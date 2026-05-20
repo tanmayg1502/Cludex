@@ -13,7 +13,7 @@ BRIDGE_DIR="${ROOT_DIR}/phodex-bridge"
 RELAY_DIR="${ROOT_DIR}/relay"
 RELAY_SERVER_MODULE="${RELAY_DIR}/server.js"
 
-RELAY_BIND_HOST="${RELAY_BIND_HOST:-0.0.0.0}"
+RELAY_BIND_HOST="${RELAY_BIND_HOST:-::}"
 RELAY_PORT="${RELAY_PORT:-9000}"
 RELAY_HOSTNAME="${RELAY_HOSTNAME:-}"
 RELAY_URL="${RELAY_URL:-}"
@@ -42,7 +42,7 @@ Options:
   --help                Show this help text
 
 Defaults:
-  --bind-host           0.0.0.0
+  --bind-host           :: (IPv6 dual-stack)
   --port                9000
   --hostname            macOS LocalHostName.local, then hostname, then localhost
   --relay-url           auto-built as ws://<hostname>:<port>/relay
