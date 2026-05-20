@@ -552,6 +552,7 @@ struct TurnView: View {
     private var connectionRecoverySnapshot: ConnectionRecoverySnapshot? {
         TurnConnectionRecoverySnapshotBuilder.makeSnapshot(
             hasReconnectCandidate: codex.hasReconnectCandidate,
+            hasSavedConnectionState: codex.hasSavedConnectionState,
             isConnected: codex.isConnected,
             secureConnectionState: codex.secureConnectionState,
             showsWakeSavedMacDisplayAction: shouldOfferWakeSavedMacDisplayAction,
@@ -1227,11 +1228,20 @@ struct TurnView: View {
 
     private var reasoningDisplayOptions: [TurnComposerReasoningDisplayOption] {
         TurnComposerMetaMapper.reasoningDisplayOptions(
-            from: codex.supportedReasoningEffortsForSelectedModel().map(\.reasoningEffort)
+            from: codex.supportedReasoningEffortsForSelectedModel(threadId: thread.id).map(\.reasoningEffort)
         )
     }
 
     private var selectedModelTitle: String {
+        if let threadModel = codex.effectiveModelIdentifierForComposer(threadId: thread.id),
+           let selectedModel = codex.modelOption(matching: threadModel) {
+            return TurnComposerMetaMapper.modelTitle(for: selectedModel)
+        }
+
+        if let threadModel = codex.effectiveModelIdentifierForComposer(threadId: thread.id) {
+            return TurnComposerMetaMapper.modelTitle(forIdentifier: threadModel)
+        }
+
         if let selectedModel = codex.selectedModelOption() {
             return TurnComposerMetaMapper.modelTitle(for: selectedModel)
         }

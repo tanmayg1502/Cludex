@@ -9,6 +9,7 @@ import Foundation
 enum TurnConnectionRecoverySnapshotBuilder {
     static func makeSnapshot(
         hasReconnectCandidate: Bool,
+        hasSavedConnectionState: Bool,
         isConnected: Bool,
         secureConnectionState: CodexSecureConnectionState,
         showsWakeSavedMacDisplayAction: Bool,
@@ -18,16 +19,22 @@ enum TurnConnectionRecoverySnapshotBuilder {
         isRetryingConnectionRecovery: Bool,
         lastErrorMessage: String?
     ) -> ConnectionRecoverySnapshot? {
-        guard hasReconnectCandidate,
+        guard (hasReconnectCandidate || hasSavedConnectionState),
               !isConnected else {
             return nil
         }
 
-        guard secureConnectionState != .rePairRequired || showsWakeSavedMacDisplayAction else {
-            return nil
-        }
-
         let trimmedError = lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard secureConnectionState != .rePairRequired || showsWakeSavedMacDisplayAction else {
+            return ConnectionRecoverySnapshot(
+                summary: trimmedError?.isEmpty == false
+                    ? trimmedError ?? ""
+                    : "Pair with a fresh QR code from the menu to resume this chat.",
+                status: .actionRequired,
+                trailingStyle: .none
+            )
+        }
 
         if isWakingMacDisplayRecovery {
             return ConnectionRecoverySnapshot(
@@ -46,6 +53,16 @@ enum TurnConnectionRecoverySnapshotBuilder {
                 summary: "Trying to reconnect to your computer.",
                 status: .reconnecting,
                 trailingStyle: .progress
+            )
+        }
+
+        guard hasReconnectCandidate else {
+            return ConnectionRecoverySnapshot(
+                summary: trimmedError?.isEmpty == false
+                    ? trimmedError ?? ""
+                    : "Pair with a fresh QR code from the menu to resume this chat.",
+                status: .actionRequired,
+                trailingStyle: .none
             )
         }
 

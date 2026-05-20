@@ -32,6 +32,8 @@ struct TurnTimelineFooterContainer<Composer: View>: View {
         }
 
         footerContent
+            .frame(maxWidth: .infinity)
+            .clipped()
             .overlay(alignment: .top) {
                 if shouldShowScrollToLatestButton, let onScrollToLatest {
                     scrollToLatestButton(action: onScrollToLatest)
